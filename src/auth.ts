@@ -102,7 +102,7 @@ function buildQRPage(qrUrl: string): string {
     <h2>WeChat × Claude Code</h2>
     <p class="subtitle">Scan with WeChat to connect</p>
     <div id="qr-container">
-      <img id="qr-img" src="${qrUrl}" onerror="this.alt='QR failed to load: ${qrUrl}'" />
+      <img id="qr-img" src="https://api.qrserver.com/v1/create-qr-code/?size=280x280&data=${encodeURIComponent(qrUrl)}" style="width:280px;height:280px;border-radius:12px;background:white;padding:16px" />
     </div>
     <p id="status">Waiting for scan...</p>
   </div>
@@ -116,11 +116,20 @@ function buildQRPage(qrUrl: string): string {
           el.textContent = 'Scanned! Confirm on your phone...';
           el.style.color = '#f0ad4e';
         } else if (data.status === 'success') {
-          el.textContent = 'Connected!';
-          el.style.color = '#5cb85c';
-          document.getElementById('qr-container').style.display = 'none';
           clearInterval(poll);
-          setTimeout(() => window.close(), 3000);
+          const cmd = 'claude --dangerously-load-development-channels server:wechat-channel';
+          navigator.clipboard.writeText(cmd).catch(()=>{});
+          document.querySelector('.container').innerHTML = \`
+            <div style="text-align:center;max-width:420px">
+              <div style="font-size:64px;margin-bottom:16px">&#10003;</div>
+              <h2 style="font-size:28px;font-weight:600;margin-bottom:8px;color:#fff">WeChat Connected</h2>
+              <p style="color:#888;margin-bottom:32px;font-size:15px">Command copied to clipboard</p>
+              <div style="background:#2a2a3e;border-radius:10px;padding:14px 18px;font-family:'SF Mono',Menlo,monospace;font-size:13px;color:#a8b4ff;text-align:left;cursor:pointer;transition:background .2s" onclick="navigator.clipboard.writeText('\${cmd}');this.style.background='#1e3a1e';setTimeout(()=>this.style.background='#2a2a3e',800)">
+                \${cmd}
+              </div>
+              <p style="color:#555;margin-top:24px;font-size:13px">Paste in a new terminal to start</p>
+            </div>\`;
+
         } else if (data.status === 'expired') {
           el.textContent = 'QR expired, refreshing...';
           el.style.color = '#d9534f';
@@ -128,7 +137,7 @@ function buildQRPage(qrUrl: string): string {
             const r2 = await fetch('/qr-refresh');
             const d2 = await r2.json();
             if (d2.url) {
-              document.getElementById('qr-img').src = d2.url;
+              document.getElementById('qr-img').src = 'https://api.qrserver.com/v1/create-qr-code/?size=280x280&data=' + encodeURIComponent(d2.url);
               el.textContent = 'QR refreshed, scan again...';
               el.style.color = '#888';
             }

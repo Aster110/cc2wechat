@@ -14,7 +14,9 @@ import {
   sendMessage,
   sendTyping,
   getConfig,
+  uploadAndSendMedia,
 } from './wechat-api.js';
+import fs from 'node:fs';
 import type { WeixinMessage } from './types.js';
 import { MessageItemType } from './types.js';
 
@@ -127,7 +129,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply to a WeChat message. The content will be converted from markdown to plain text automatically.',
+        'Reply to a WeChat message. Supports text and image/file. Set media to a local file path to send an image or file.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -141,7 +143,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           content: {
             type: 'string',
-            description: 'The reply text content (markdown will be stripped)',
+            description: 'Text content',
+          },
+          media: {
+            type: 'string',
+            description: 'Optional: absolute path to a local file (image/video/file) to send',
           },
         },
         required: ['user_id', 'context_token', 'content'],
@@ -195,11 +201,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const userId = (args as Record<string, string>).user_id;
     const contextToken = (args as Record<string, string>).context_token;
     const content = (args as Record<string, string>).content;
+    const media = (args as Record<string, string>).media;
 
     if (!userId || !contextToken || !content) {
       return {
         content: [
           { type: 'text' as const, text: 'Missing required fields: user_id, context_token, content' },
+        ],
+        isError: true,
+      };
+    }
+
+    // Validate media path if provided
+    if (media && !fs.existsSync(media)) {
+      return {
+        content: [
+          { type: 'text' as const, text: `Media file not found: ${media}` },
         ],
         isError: true,
       };
@@ -230,16 +247,32 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         await sendMessage(account.token, userId, chunk, contextToken, account.baseUrl);
       }
 
+      // Send media if provided
+      let mediaSent = false;
+      if (media) {
+        await uploadAndSendMedia({
+          token: account.token,
+          toUser: userId,
+          contextToken,
+          filePath: media,
+          baseUrl: account.baseUrl,
+        });
+        mediaSent = true;
+      }
+
       // Cancel typing
       if (ticket) {
         await sendTyping(account.token, userId, ticket, 2, account.baseUrl).catch(() => {});
       }
 
+      const parts = [`Reply sent to ${userId} (${chunks.length} chunk${chunks.length > 1 ? 's' : ''})`];
+      if (mediaSent) parts.push(`Media sent: ${media}`);
+
       return {
         content: [
           {
             type: 'text' as const,
-            text: `Reply sent to ${userId} (${chunks.length} chunk${chunks.length > 1 ? 's' : ''})`,
+            text: parts.join('. '),
           },
         ],
       };
@@ -370,7 +403,7 @@ async function pollLoop(account: { token: string; accountId: string; baseUrl?: s
         server.notification({
           method: 'notifications/claude/channel',
           params: {
-            content: text,
+            content: `${text}\n\n[System: Reply via the "reply" tool. user_id and context_token are in the message metadata above.]`,
             meta: {
               source: 'wechat',
               sender: fromUser,

@@ -1,14 +1,17 @@
 {
-  "name": "wechat-cc-channel",
-  "version": "1.0.0",
-  "description": "WeChat channel for Claude Code via iLink Bot API",
+  "name": "@aster110/cc2wechat",
+  "version": "1.0.3",
+  "description": "WeChat channel for Claude Code — chat with Claude Code from WeChat via iLink Bot API",
   "type": "module",
   "bin": {
+    "cc2wechat": "dist/cli.js",
+    "cc2wechat-reply": "dist/reply-cli.js",
     "wechat-cc-channel": "dist/server.js"
   },
   "scripts": {
     "build": "tsc",
-    "dev": "tsx src/server.ts"
+    "dev": "tsx src/server.ts",
+    "prepublishOnly": "npm run build"
   },
   "engines": {
     "node": ">=22"

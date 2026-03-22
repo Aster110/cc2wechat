@@ -1,4 +1,6 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import type {
   BaseInfo,
   GetUpdatesResp,
@@ -8,6 +10,7 @@ import type {
 } from './types.js';
 
 const BASE_URL = 'https://ilinkai.weixin.qq.com';
+const CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
 const CHANNEL_VERSION = '1.0.0';
 
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
@@ -232,4 +235,171 @@ export async function getConfig(
     label: 'getConfig',
   });
   return JSON.parse(rawText) as GetConfigResp;
+}
+
+// ---------------------------------------------------------------------------
+// CDN Upload & Media Send
+// ---------------------------------------------------------------------------
+
+/** AES-128-ECB encrypt (PKCS7 padding). */
+export function encryptAesEcb(plaintext: Buffer, key: Buffer): Buffer {
+  const cipher = crypto.createCipheriv('aes-128-ecb', key, null);
+  return Buffer.concat([cipher.update(plaintext), cipher.final()]);
+}
+
+/** Compute AES-ECB ciphertext size (PKCS7 padding). */
+export function aesEcbPaddedSize(plaintextSize: number): number {
+  return Math.ceil((plaintextSize + 1) / 16) * 16;
+}
+
+/** Determine media type from file extension: 1=IMAGE, 2=VIDEO, 3=FILE. */
+function detectMediaType(filePath: string): number {
+  const ext = path.extname(filePath).toLowerCase();
+  if (['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'].includes(ext)) return 1;
+  if (['.mp4', '.mov', '.avi', '.mkv'].includes(ext)) return 2;
+  return 3;
+}
+
+interface GetUploadUrlResp {
+  upload_param?: string;
+  filekey?: string;
+}
+
+/**
+ * Upload a local file to WeChat CDN and send it as a media message.
+ */
+export async function uploadAndSendMedia(params: {
+  token: string;
+  toUser: string;
+  contextToken: string;
+  filePath: string;
+  baseUrl?: string;
+  cdnBaseUrl?: string;
+}): Promise<void> {
+  const { token, toUser, contextToken, filePath, baseUrl, cdnBaseUrl } = params;
+
+  // 1. Read file, compute rawsize + MD5
+  const fileData = fs.readFileSync(filePath);
+  const rawsize = fileData.length;
+  const rawfilemd5 = crypto.createHash('md5').update(fileData).digest('hex');
+
+  // 2. Generate random AES key (16 bytes)
+  const aeskey = crypto.randomBytes(16);
+
+  // 3. Detect media type
+  const mediaType = detectMediaType(filePath);
+
+  // 4. Encrypt
+  const ciphertext = encryptAesEcb(fileData, aeskey);
+  const ciphertextSize = ciphertext.length;
+
+  // 5. Get upload URL
+  const filekey = `wcc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${path.extname(filePath)}`;
+
+  const uploadUrlBody = JSON.stringify({
+    filekey,
+    media_type: mediaType,
+    to_user_id: toUser,
+    rawsize,
+    rawfilemd5,
+    filesize: ciphertextSize,
+    no_need_thumb: true,
+    aeskey: aeskey.toString('hex'),
+    base_info: buildBaseInfo(),
+  });
+
+  const uploadUrlRaw = await apiFetch({
+    baseUrl,
+    endpoint: 'ilink/bot/getuploadurl',
+    body: uploadUrlBody,
+    token,
+    timeoutMs: DEFAULT_API_TIMEOUT_MS,
+    label: 'getUploadUrl',
+  });
+  const uploadUrlResp = JSON.parse(uploadUrlRaw) as GetUploadUrlResp;
+  const uploadParam = uploadUrlResp.upload_param;
+  const serverFilekey = uploadUrlResp.filekey || filekey;
+  if (!uploadParam) {
+    throw new Error('getUploadUrl did not return upload_param');
+  }
+
+  // 6. Upload to CDN
+  const cdn = cdnBaseUrl ?? CDN_BASE_URL;
+  const uploadUrl = `${cdn}/upload?encrypted_query_param=${encodeURIComponent(uploadParam)}&filekey=${encodeURIComponent(serverFilekey)}`;
+
+  const headers = buildHeaders(token);
+  headers['Content-Type'] = 'application/octet-stream';
+  headers['Content-Length'] = String(ciphertextSize);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 60_000);
+  try {
+    const res = await fetch(uploadUrl, {
+      method: 'POST',
+      headers,
+      body: new Uint8Array(ciphertext),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`CDN upload failed: ${res.status} ${body}`);
+    }
+
+    const downloadParam = res.headers.get('x-encrypted-param');
+    if (!downloadParam) {
+      throw new Error('CDN upload did not return x-encrypted-param header');
+    }
+
+    // 7. Build media item and send message
+    const aesKeyBase64 = Buffer.from(aeskey.toString('hex')).toString('base64');
+    const mediaInfo = {
+      encrypt_query_param: downloadParam,
+      aes_key: aesKeyBase64,
+      encrypt_type: 1,
+    };
+
+    let mediaItem: Record<string, unknown>;
+    if (mediaType === 1) {
+      mediaItem = { type: 2, image_item: { media: mediaInfo, mid_size: ciphertextSize } };
+    } else if (mediaType === 2) {
+      mediaItem = { type: 5, video_item: { media: mediaInfo, video_size: ciphertextSize } };
+    } else {
+      mediaItem = {
+        type: 4,
+        file_item: {
+          media: mediaInfo,
+          file_name: path.basename(filePath),
+          len: String(rawsize),
+          md5: rawfilemd5,
+        },
+      };
+    }
+
+    const msgBody = {
+      msg: {
+        from_user_id: '',
+        to_user_id: toUser,
+        client_id: `wcc-${Date.now()}`,
+        message_type: 2,
+        message_state: 2,
+        item_list: [mediaItem],
+        context_token: contextToken,
+      },
+      base_info: buildBaseInfo(),
+    };
+
+    await apiFetch({
+      baseUrl,
+      endpoint: 'ilink/bot/sendmessage',
+      body: JSON.stringify(msgBody),
+      token,
+      timeoutMs: DEFAULT_API_TIMEOUT_MS,
+      label: 'sendMediaMessage',
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    throw err;
+  }
 }
