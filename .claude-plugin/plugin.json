@@ -1,0 +1,6 @@
+{
+  "id": "wechat-channel",
+  "name": "WeChat Channel",
+  "version": "1.0.0",
+  "description": "WeChat channel for Claude Code via iLink Bot API"
+}

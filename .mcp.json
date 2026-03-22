@@ -1,0 +1,6 @@
+{
+  "wechat-channel": {
+    "command": "node",
+    "args": ["dist/server.js"]
+  }
+}
