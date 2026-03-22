@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { extractText, userIdToSessionUUID } from '../src/utils.js';
+import { extractText, userIdToSessionUUID, sleep } from '../src/utils.js';
 import { MessageItemType } from '../src/types.js';
 import type { WeixinMessage } from '../src/types.js';
 
@@ -58,6 +58,27 @@ describe('extractText', () => {
     };
     expect(extractText(msg)).toBe('line1\n[Image]');
   });
+
+  it('returns [Empty message] for VOICE without text', () => {
+    const msg: WeixinMessage = {
+      item_list: [{ type: MessageItemType.VOICE, voice_item: {} }],
+    };
+    expect(extractText(msg)).toBe('[Empty message]');
+  });
+
+  it('returns [Empty message] for FILE without file_name', () => {
+    const msg: WeixinMessage = {
+      item_list: [{ type: MessageItemType.FILE, file_item: {} }],
+    };
+    expect(extractText(msg)).toBe('[Empty message]');
+  });
+
+  it('skips items with unknown type', () => {
+    const msg: WeixinMessage = {
+      item_list: [{ type: 99 }],
+    };
+    expect(extractText(msg)).toBe('[Empty message]');
+  });
 });
 
 describe('userIdToSessionUUID', () => {
@@ -77,5 +98,19 @@ describe('userIdToSessionUUID', () => {
     const a = userIdToSessionUUID('user_a');
     const b = userIdToSessionUUID('user_b');
     expect(a).not.toBe(b);
+  });
+});
+
+describe('sleep', () => {
+  it('resolves after the specified duration', async () => {
+    const start = Date.now();
+    await sleep(50);
+    const elapsed = Date.now() - start;
+    expect(elapsed).toBeGreaterThanOrEqual(40); // allow small timing variance
+  });
+
+  it('resolves to undefined', async () => {
+    const result = await sleep(1);
+    expect(result).toBeUndefined();
   });
 });

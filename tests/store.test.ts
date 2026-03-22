@@ -75,6 +75,24 @@ describe('store', () => {
     });
   });
 
+  describe('removeAccount', () => {
+    it('removes an existing account', () => {
+      store.saveAccount({ accountId: 'a1', token: 't1', savedAt: '2026-01-01' });
+      store.saveAccount({ accountId: 'a2', token: 't2', savedAt: '2026-01-02' });
+      store.removeAccount('a1');
+      const accounts = store.loadAccounts();
+      expect(accounts).toHaveLength(1);
+      expect(accounts[0]!.accountId).toBe('a2');
+    });
+
+    it('does nothing when removing a non-existent account', () => {
+      store.saveAccount({ accountId: 'a1', token: 't1', savedAt: '2026-01-01' });
+      store.removeAccount('nonexistent');
+      const accounts = store.loadAccounts();
+      expect(accounts).toHaveLength(1);
+    });
+  });
+
   describe('loadSyncBuf / saveSyncBuf', () => {
     it('returns empty string when no buf saved', () => {
       expect(store.loadSyncBuf('nonexistent')).toBe('');

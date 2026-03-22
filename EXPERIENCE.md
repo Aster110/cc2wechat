@@ -139,10 +139,51 @@ sendMessage 的 `image_item.url` 字段虽然存在，但直接传远程 URL 微
   - image_item.media.aes_key: base64(hex string)
 - CDN Base URL: `https://novac2c.cdn.weixin.qq.com/c2c`
 
-## 六、待解决
+## 六、v3 Interactive Terminal 模式踩坑
+
+> 2026-03-22 v3 重构
+
+### 坑 9：iTerm tab name 被 CC 覆盖
+
+最初用 tab name（`wechat-xxx`）标识用户窗口。问题：CC 启动后会把 tab title 改成自己的（显示 session info），导致 `tabExists()` 按 name 找不到已有窗口，重复创建。
+
+**解决方案**: 改用 iTerm window id。创建窗口时 `return id of w` 拿到数字 id，后续用 `first window whose id is <id>` 定位。window id 是 iTerm 内部分配的，CC 改不了。
+
+### 坑 10：多实例竞争 — tab registry 持久化
+
+daemon 重启后内存中的 `userTabs` Map 清空，无法找到之前创建的 iTerm 窗口。导致每次重启都创建新窗口，老窗口变成孤儿。
+
+**解决方案**: 把 `tabName → windowId` 的映射持久化到 `/tmp/cc2wechat-tabs.json`。启动时加载，每次创建/更新窗口时写入。`tabExists()` 先查 registry 拿到 window id，再用 AppleScript 验证窗口是否还在。
+
+### 坑 11：AppleScript 中 iTerm vs iTerm2 名称差异
+
+AppleScript 里 iTerm 的 application name 是 `"iTerm2"` 而不是 `"iTerm"`。写成 `tell application "iTerm"` 会弹出 "找不到应用" 的对话框，阻塞 execSync。
+
+**解决方案**: 统一用 `tell application "iTerm2"`。注意 Finder 里显示的名字是 "iTerm"，但 AppleScript identifier 是 "iTerm2"。
+
+### 坑 12：claude -p 不支持 Agent Teams
+
+v2 pipe 模式用 `claude -p <prompt>` 调用 CC。这种模式下 CC 以单次问答模式运行，**不支持 Agent Teams**（spawn worker、TeamCreate 等）。这是 v3 改用 interactive terminal 模式的核心原因。
+
+interactive 模式（`claude --resume`）下 CC 拥有完整能力：Agent Teams、MCP tools、multi-turn 等。
+
+### 坑 13：system prompt 的 reply-cli 路径问题
+
+pipe 模式的 system prompt 里写了 `node ${replyCli} --text "reply"`，其中 `replyCli` 用 `import.meta.url` 算出来的绝对路径。问题：
+
+1. 路径指向 `dist/` 编译产物目录，但 `reply-cli.js` 可能不在预期位置
+2. 如果用 npx 安装，路径是临时目录，下次运行就变了
+
+**解决方案**: `path.join(__dirname, '..', 'reply-cli.js')` 基于当前文件相对定位。terminal 模式下由 CC 的 system prompt（在 skill 文件里）指定 reply-cli 路径，不硬编码在代码里。
+
+---
+
+## 七、待解决
 
 1. **CDN 媒体上传/下载**：图片/文件需要 AES-128-ECB 加密，openclaw 插件有完整实现可参考
 2. **Channel notification 实测**：需要用 `--dangerously-load-development-channels` 启动 CC 测试
 3. **多账号支持**：当前只支持一个账号
 4. **重连机制**：token 失效后是否需要重新扫码？
 5. **npm 包发布**：package name、README、license
+6. **terminal.ts execSync 无 try/catch**：iTerm 未运行时 AppleScript 会抛错，应 fallback 到 pipe 模式
+7. **/tmp 安全**：context.json 含 token，应 chmod 600 或移到 ~/.claude/ 下
