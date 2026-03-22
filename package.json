@@ -1,6 +1,6 @@
 {
   "name": "@aster110/cc2wechat",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "description": "WeChat channel for Claude Code — chat with Claude Code from WeChat via iLink Bot API",
   "type": "module",
   "bin": {
@@ -11,6 +11,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/server.ts",
+    "test": "vitest run",
     "prepublishOnly": "npm run build"
   },
   "engines": {
@@ -23,7 +24,8 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
   },
   "license": "MIT"
 }
