@@ -155,7 +155,9 @@ function buildQRPage(qrUrl: string): string {
 }
 
 function openBrowser(url: string): void {
-  const cmd = process.platform === 'darwin' ? 'open' : 'xdg-open';
+  const cmd = process.platform === 'darwin' ? 'open'
+    : process.platform === 'win32' ? 'start'
+    : 'xdg-open';
   exec(`${cmd} ${url}`, () => {});
 }
 
