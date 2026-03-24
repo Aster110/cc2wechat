@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 import type { WeixinMessage } from '../types.js';
 import type { AccountData } from '../store.js';
-import { extractText, userIdToSessionUUID } from '../utils.js';
+import { extractText, userIdToSessionUUID, log } from '../utils.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const replyCli = path.join(__dirname, '..', 'reply-cli.js');
@@ -19,7 +19,7 @@ export async function handleMessagePipe(msg: WeixinMessage, account: AccountData
   const sessionId = userIdToSessionUUID(userId);
   const cwd = process.cwd();
 
-  console.log(`[cc2wechat] -> pipe mode: ${text.slice(0, 30)}...`);
+  log(`-> pipe mode: ${text.slice(0, 30)}...`);
   const prompt = JSON.stringify(text);
   const systemPrompt = JSON.stringify(`You are responding to a WeChat message. Keep replies concise. Use this to reply: node ${replyCli} --text "reply" or node ${replyCli} --image /path/to/file`);
   let result: string;
@@ -52,5 +52,5 @@ export async function handleMessagePipe(msg: WeixinMessage, account: AccountData
   for (const chunk of chunks) {
     await sendMsg(account.token, userId, chunk, msg.context_token ?? '', account.baseUrl);
   }
-  console.log(`[cc2wechat] -> replied (${chunks.length} chunk)`);
+  log(`-> replied (${chunks.length} chunk)`);
 }

@@ -1,21 +1,33 @@
 #!/usr/bin/env node
 
 import fs from 'node:fs';
+import http from 'node:http';
 
 import { loginWithQRWeb } from './auth.js';
 import { getActiveAccount, saveAccount, loadSyncBuf, saveSyncBuf } from './store.js';
-import { getUpdates, sendTyping, getConfig } from './wechat-api.js';
+import { getUpdates, sendTyping, getConfig, downloadMedia } from './wechat-api.js';
+import { MessageItemType } from './types.js';
 import type { WeixinMessage } from './types.js';
 import type { AccountData } from './store.js';
-import { extractText } from './utils.js';
+import { extractText, log, logError } from './utils.js';
 import { handleMessageTerminal } from './handlers/terminal.js';
 import { handleMessagePipe } from './handlers/pipe.js';
+import { handleMessageSDK } from './handlers/sdk.js';
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 const IS_MACOS = process.platform === 'darwin';
+const HEALTH_PORT = parseInt(process.env.CC2WECHAT_PORT ?? '18081', 10);
+
+function hasITerm(): boolean {
+  try {
+    return fs.existsSync('/Applications/iTerm.app');
+  } catch {
+    return false;
+  }
+}
 
 const SESSION_EXPIRED_ERRCODE = -14;
 const MAX_CONSECUTIVE_FAILURES = 3;
@@ -28,15 +40,72 @@ function sleep(ms: number): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Media download helper
+// ---------------------------------------------------------------------------
+
+const MEDIA_TYPE_EXT: Record<number, string> = {
+  [MessageItemType.IMAGE]: '.jpg',
+  [MessageItemType.VIDEO]: '.mp4',
+  [MessageItemType.FILE]: '',
+};
+
+async function downloadMediaItems(
+  msg: WeixinMessage,
+  account: AccountData,
+): Promise<Map<number, string>> {
+  const result = new Map<number, string>();
+  const items = msg.item_list ?? [];
+  const msgId = msg.message_id ?? Date.now();
+
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    if (item.type !== MessageItemType.IMAGE &&
+        item.type !== MessageItemType.VIDEO &&
+        item.type !== MessageItemType.FILE) continue;
+
+    // Get the CDNMedia info from the appropriate item field
+    const media = item.image_item?.media ?? item.video_item?.media ?? item.file_item?.media;
+    if (!media?.encrypt_query_param || !media?.aes_key) continue;
+
+    // Determine file extension
+    let ext = MEDIA_TYPE_EXT[item.type] ?? '';
+    if (item.type === MessageItemType.FILE && item.file_item?.file_name) {
+      const dotIdx = item.file_item.file_name.lastIndexOf('.');
+      ext = dotIdx >= 0 ? item.file_item.file_name.slice(dotIdx) : '';
+    }
+
+    const fileName = `${msgId}-${i}${ext}`;
+
+    try {
+      const filePath = await downloadMedia({
+        token: account.token,
+        encryptQueryParam: media.encrypt_query_param,
+        aesKey: media.aes_key,
+        outputFileName: fileName,
+        baseUrl: account.baseUrl,
+      });
+      result.set(i, filePath);
+      log(`downloaded media: ${filePath}`);
+    } catch (err) {
+      logError(`media download failed for item ${i}: ${String(err)}`);
+    }
+  }
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Core message handler — routes to platform-specific handler
 // ---------------------------------------------------------------------------
 
 async function handleMessage(msg: WeixinMessage, account: AccountData): Promise<void> {
-  const text = extractText(msg);
+  // Download media items (images, files, videos) before extracting text
+  const mediaPaths = await downloadMediaItems(msg, account);
+  const text = extractText(msg, mediaPaths);
   const userId = msg.from_user_id ?? '';
   const contextToken = msg.context_token ?? '';
 
-  console.log(`[cc2wechat] <- ${userId.slice(0, 10)}...: ${text.slice(0, 50)}`);
+  log(`<- ${userId.slice(0, 10)}...: ${text.slice(0, 50)}`);
 
   // Write context for reply-cli
   fs.writeFileSync('/tmp/cc2wechat-context.json', JSON.stringify({
@@ -56,10 +125,10 @@ async function handleMessage(msg: WeixinMessage, account: AccountData): Promise<
     // non-critical
   }
 
-  if (IS_MACOS) {
-    await handleMessageTerminal(msg, account);
+  if (IS_MACOS && hasITerm()) {
+    await handleMessageTerminal(msg, account, text);  // macOS + iTerm: fast lane
   } else {
-    await handleMessagePipe(msg, account);
+    await handleMessageSDK(msg, account, text);       // universal fallback
   }
 }
 
@@ -72,7 +141,7 @@ async function pollLoop(account: AccountData): Promise<void> {
   let consecutiveFailures = 0;
   let nextTimeoutMs = 35_000;
 
-  console.log(`[cc2wechat] Polling started for account ${account.accountId}`);
+  log(`Polling started for account ${account.accountId}`);
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -94,8 +163,8 @@ async function pollLoop(account: AccountData): Promise<void> {
           resp.errcode === SESSION_EXPIRED_ERRCODE || resp.ret === SESSION_EXPIRED_ERRCODE;
 
         if (isSessionExpired) {
-          console.log(
-            `[cc2wechat] Session expired (errcode ${SESSION_EXPIRED_ERRCODE}), pausing ${Math.ceil(SESSION_PAUSE_MS / 60_000)} min`,
+          log(
+            `Session expired (errcode ${SESSION_EXPIRED_ERRCODE}), pausing ${Math.ceil(SESSION_PAUSE_MS / 60_000)} min`,
           );
           consecutiveFailures = 0;
           await sleep(SESSION_PAUSE_MS);
@@ -103,8 +172,8 @@ async function pollLoop(account: AccountData): Promise<void> {
         }
 
         consecutiveFailures++;
-        console.error(
-          `[cc2wechat] getUpdates error: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg ?? ''} (${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES})`,
+        logError(
+          `getUpdates error: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg ?? ''} (${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES})`,
         );
         if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
           consecutiveFailures = 0;
@@ -134,8 +203,11 @@ async function pollLoop(account: AccountData): Promise<void> {
       }
     } catch (err) {
       consecutiveFailures++;
-      console.error(
-        `[cc2wechat] Poll error (${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES}): ${String(err)}`,
+      const errMsg = err instanceof Error
+        ? `${err.message}${err.cause ? ` | cause: ${String(err.cause)}` : ''}${err.stack ? `\n${err.stack.split('\n').slice(1, 3).join('\n')}` : ''}`
+        : String(err);
+      logError(
+        `Poll error (${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES}): ${errMsg}`,
       );
       if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
         consecutiveFailures = 0;
@@ -151,8 +223,28 @@ async function pollLoop(account: AccountData): Promise<void> {
 // Main
 // ---------------------------------------------------------------------------
 
+/** 检测端口是否被占用 */
+async function isPortInUse(port: number): Promise<number | null> {
+  try {
+    const { execSync } = await import('node:child_process');
+    const pid = execSync(`lsof -i :${port} -t -sTCP:LISTEN 2>/dev/null`, { encoding: 'utf-8' }).trim();
+    return pid ? parseInt(pid, 10) : null;
+  } catch {
+    return null;
+  }
+}
+
 async function main(): Promise<void> {
-  console.log('\n  cc2wechat v3 — Interactive Terminal Mode\n');
+  console.log('\n  cc2wechat v4 — SDK + Terminal Mode\n');
+
+  // 防重复启动：检测端口是否已被占用
+  const existingPid = await isPortInUse(HEALTH_PORT);
+  if (existingPid) {
+    console.log(`  ⚠️  cc2wechat 已在运行 (PID ${existingPid}, port ${HEALTH_PORT})`);
+    console.log(`  用 cc2wechat stop 停止，或 cc2wechat restart 重启`);
+    console.log(`  多账号？用 CC2WECHAT_PORT=18082 cc2wechat start\n`);
+    process.exit(0);
+  }
 
   let account = getActiveAccount();
   if (!account) {
@@ -168,7 +260,27 @@ async function main(): Promise<void> {
   }
 
   console.log(`  Account: ${account.accountId}`);
+  console.log(`  Health check: http://localhost:${HEALTH_PORT}/health`);
   console.log('  Listening for WeChat messages...\n');
+
+  // Health check HTTP server
+  const startedAt = new Date().toISOString();
+  http.createServer((req, res) => {
+    if (req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        status: 'running',
+        account: account!.accountId,
+        startedAt,
+        uptime: process.uptime(),
+      }));
+    } else {
+      res.writeHead(404);
+      res.end('Not Found');
+    }
+  }).listen(HEALTH_PORT, () => {
+    log(`Health server on :${HEALTH_PORT}`);
+  });
 
   await pollLoop(account);
 }

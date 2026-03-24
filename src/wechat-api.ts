@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import fsp from 'node:fs/promises';
 import path from 'node:path';
 import type {
   BaseInfo,
@@ -398,6 +399,87 @@ export async function uploadAndSendMedia(params: {
       timeoutMs: DEFAULT_API_TIMEOUT_MS,
       label: 'sendMediaMessage',
     });
+  } catch (err) {
+    clearTimeout(timer);
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CDN Download & Media Receive
+// ---------------------------------------------------------------------------
+
+const MEDIA_DIR = '/tmp/cc2wechat-media';
+
+/** AES-128-ECB decrypt (reverse of encryptAesEcb). */
+export function decryptAesEcb(ciphertext: Buffer, key: Buffer): Buffer {
+  const decipher = crypto.createDecipheriv('aes-128-ecb', key, null);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+}
+
+/**
+ * Decode the aes_key from message format back to raw 16-byte key.
+ *
+ * Upload encodes as: base64(hex_string_of_16_bytes)
+ * So we: base64-decode → hex string → Buffer.from(hex)
+ */
+export function decodeAesKey(aesKeyField: string): Buffer {
+  const hexStr = Buffer.from(aesKeyField, 'base64').toString('utf-8');
+  return Buffer.from(hexStr, 'hex');
+}
+
+/**
+ * Download and decrypt a media file from WeChat CDN.
+ *
+ * @returns absolute path of the saved file
+ */
+export async function downloadMedia(params: {
+  token: string;
+  encryptQueryParam: string;
+  aesKey: string;
+  outputFileName: string;
+  baseUrl?: string;
+  cdnBaseUrl?: string;
+}): Promise<string> {
+  const { token, encryptQueryParam, aesKey, outputFileName, cdnBaseUrl } = params;
+
+  // Ensure output dir
+  await fsp.mkdir(MEDIA_DIR, { recursive: true });
+
+  // 1. Download encrypted data from CDN
+  const cdn = cdnBaseUrl ?? CDN_BASE_URL;
+  const downloadUrl = `${cdn}/download?encrypted_query_param=${encodeURIComponent(encryptQueryParam)}`;
+
+  const headers = buildHeaders(token);
+  headers['Content-Type'] = 'application/octet-stream';
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 60_000);
+
+  try {
+    const res = await fetch(downloadUrl, {
+      method: 'GET',
+      headers,
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`CDN download failed: ${res.status} ${body}`);
+    }
+
+    const encryptedData = Buffer.from(await res.arrayBuffer());
+
+    // 2. Decrypt
+    const key = decodeAesKey(aesKey);
+    const plaintext = decryptAesEcb(encryptedData, key);
+
+    // 3. Write to file
+    const outputPath = path.join(MEDIA_DIR, outputFileName);
+    await fsp.writeFile(outputPath, plaintext);
+
+    return outputPath;
   } catch (err) {
     clearTimeout(timer);
     throw err;

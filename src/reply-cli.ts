@@ -6,10 +6,27 @@ import fs from 'node:fs';
 import { sendMessage, uploadAndSendMedia } from './wechat-api.js';
 
 const args = process.argv.slice(2);
-const contextPath = '/tmp/cc2wechat-context.json';
+
+// 查找 context 文件：优先环境变量 → 扫描 /tmp/cc2wechat-ctx-*.json（取最新）→ legacy 路径
+function findContextPath(): string {
+  if (process.env.CC2WECHAT_CONTEXT && fs.existsSync(process.env.CC2WECHAT_CONTEXT)) {
+    return process.env.CC2WECHAT_CONTEXT;
+  }
+  // 扫描所有 per-user context 文件，取最近修改的
+  try {
+    const files = fs.readdirSync('/tmp')
+      .filter(f => f.startsWith('cc2wechat-ctx-') && f.endsWith('.json'))
+      .map(f => ({ name: f, mtime: fs.statSync(`/tmp/${f}`).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime);
+    if (files.length > 0) return `/tmp/${files[0].name}`;
+  } catch { /* ignore */ }
+  return '/tmp/cc2wechat-context.json';
+}
+
+const contextPath = findContextPath();
 
 if (!fs.existsSync(contextPath)) {
-  console.error('No active WeChat context. cc2wechat must be running.');
+  console.error('No active WeChat context. cc2wechat daemon must be running.');
   process.exit(1);
 }
 

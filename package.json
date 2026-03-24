@@ -1,8 +1,12 @@
 {
   "name": "@aster110/cc2wechat",
-  "version": "3.1.0",
+  "version": "5.0.0",
   "description": "WeChat channel for Claude Code — chat with Claude Code from WeChat via iLink Bot API",
   "type": "module",
+  "exports": {
+    ".": "./dist/cli.js",
+    "./channel": "./dist/channel-export.js"
+  },
   "bin": {
     "cc2wechat": "dist/cli.js",
     "cc2wechat-reply": "dist/reply-cli.js",
@@ -18,6 +22,7 @@
     "node": ">=22"
   },
   "dependencies": {
+    "@aster110/cc-core": "^0.1.0",
     "@modelcontextprotocol/sdk": "^1.12.1",
     "qrcode-terminal": "^0.12.0"
   },
@@ -26,6 +31,10 @@
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org",
+    "access": "public"
   },
   "license": "MIT"
 }

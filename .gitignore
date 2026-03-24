@@ -1,3 +1,18 @@
 node_modules/
 dist/
 *.tgz
+
+# Tests (keep locally, don't open source)
+tests/
+src/__tests__/
+
+# Internal docs
+CODE_REVIEW.md
+TEST_REVIEW.md
+EXPERIENCE.md
+
+# Claude worktrees
+.claude/worktrees/
+
+# OS files
+.DS_Store

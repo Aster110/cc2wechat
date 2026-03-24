@@ -4,6 +4,10 @@ import os from 'node:os';
 
 const CHANNEL_DIR = path.join(os.homedir(), '.claude', 'channels', 'wechat-channel');
 
+function dataDir(): string {
+  return path.join(os.homedir(), '.cc2wechat');
+}
+
 function ensureDir(dir: string): void {
   fs.mkdirSync(dir, { recursive: true });
 }
@@ -17,15 +21,21 @@ export interface AccountData {
   token: string;
   baseUrl?: string;
   savedAt: string;
+  port?: number;
 }
 
 function accountsFilePath(): string {
   return path.join(CHANNEL_DIR, 'accounts.json');
 }
 
-export function loadAccounts(): AccountData[] {
+function accountsFileForPort(port: number): string {
+  return path.join(dataDir(), `accounts-${port}.json`);
+}
+
+export function loadAccounts(port?: number): AccountData[] {
+  const filePath = port != null ? accountsFileForPort(port) : accountsFilePath();
   try {
-    const raw = fs.readFileSync(accountsFilePath(), 'utf-8');
+    const raw = fs.readFileSync(filePath, 'utf-8');
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
   } catch {
@@ -33,21 +43,35 @@ export function loadAccounts(): AccountData[] {
   }
 }
 
-export function saveAccount(account: AccountData): void {
-  ensureDir(CHANNEL_DIR);
-  const accounts = loadAccounts().filter((a) => a.accountId !== account.accountId);
-  accounts.push(account);
-  const filePath = accountsFilePath();
-  fs.writeFileSync(filePath, JSON.stringify(accounts, null, 2), 'utf-8');
-  try {
-    fs.chmodSync(filePath, 0o600);
-  } catch {
-    // best-effort
+export function saveAccount(account: AccountData & { port?: number }): void {
+  if (account.port != null) {
+    const dir = dataDir();
+    ensureDir(dir);
+    const accounts = loadAccounts(account.port).filter((a) => a.accountId !== account.accountId);
+    accounts.push(account);
+    const filePath = accountsFileForPort(account.port);
+    fs.writeFileSync(filePath, JSON.stringify(accounts, null, 2), 'utf-8');
+    try {
+      fs.chmodSync(filePath, 0o600);
+    } catch {
+      // best-effort
+    }
+  } else {
+    ensureDir(CHANNEL_DIR);
+    const accounts = loadAccounts().filter((a) => a.accountId !== account.accountId);
+    accounts.push(account);
+    const filePath = accountsFilePath();
+    fs.writeFileSync(filePath, JSON.stringify(accounts, null, 2), 'utf-8');
+    try {
+      fs.chmodSync(filePath, 0o600);
+    } catch {
+      // best-effort
+    }
   }
 }
 
-export function getActiveAccount(): AccountData | null {
-  const accounts = loadAccounts();
+export function getActiveAccount(port?: number): AccountData | null {
+  const accounts = loadAccounts(port);
   return accounts.length > 0 ? accounts[accounts.length - 1]! : null;
 }
 
