@@ -1,4 +1,5 @@
 import { execSync } from 'node:child_process';
+import { logError } from '../../shared/logger.js';
 
 /**
  * 原子操作：尝试注入消息到指定 session
@@ -36,7 +37,8 @@ export function tryInject(sessionUUID: string, windowId: string, text: string): 
       end tell
     '`, { encoding: 'utf-8', timeout: 5000 }).trim();
     return result === 'ok';
-  } catch {
+  } catch (err) {
+    logError(`AppleScript inject failed for session ${sessionUUID}: ${String(err)}`);
     return false;
   }
 }

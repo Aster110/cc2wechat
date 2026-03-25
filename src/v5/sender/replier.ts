@@ -1,4 +1,5 @@
 import type { MessageSender, MessageContext } from '../interfaces/index.js';
+import { stripMarkdown } from '../shared/strip-markdown.js';
 
 export class Replier {
   constructor(
@@ -9,7 +10,7 @@ export class Replier {
   async reply(ctx: MessageContext, text: string): Promise<void> {
     let processed = text;
     if (this.opts.stripMarkdown) {
-      processed = this.stripMarkdown(processed);
+      processed = stripMarkdown(processed);
     }
 
     const chunks = this.split(processed, this.opts.maxChunkSize);
@@ -20,15 +21,6 @@ export class Replier {
 
   async replyMedia(ctx: MessageContext, filePath: string): Promise<void> {
     await this.sender.sendMedia(ctx.userId, filePath, ctx.contextToken);
-  }
-
-  private stripMarkdown(text: string): string {
-    return text
-      .replace(/```[\s\S]*?```/g, (match) => {
-        return match.replace(/^```\w*\n?/, '').replace(/\n?```$/, '');
-      })
-      .replace(/\*\*(.*?)\*\*/g, '$1')
-      .replace(/^#{1,6}\s+/gm, '');
   }
 
   private split(text: string, maxSize: number): string[] {

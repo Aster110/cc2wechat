@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import type { SessionManager, SessionEntry, SessionOpts } from '../../interfaces/index.js';
+import { logError } from '../../shared/logger.js';
 
 export class TerminalSessions implements SessionManager {
   private store = new Map<string, SessionEntry>();
@@ -57,7 +58,9 @@ export class TerminalSessions implements SessionManager {
     for (const [key, entry] of this.store) obj[key] = entry;
     try {
       fs.writeFileSync(this.filePath, JSON.stringify(obj, null, 2));
-    } catch { /* best-effort */ }
+    } catch (err) {
+      logError(`Failed to save sessions to ${this.filePath}: ${String(err)}`);
+    }
   }
 
   private loadFromDisk(): void {
@@ -71,6 +74,8 @@ export class TerminalSessions implements SessionManager {
           }
         }
       }
-    } catch { /* corrupt file — start fresh */ }
+    } catch (err) {
+      logError(`Failed to load sessions from ${this.filePath}: ${String(err)}`);
+    }
   }
 }
