@@ -81,6 +81,7 @@ export function createDefaultGateway(): CommandGateway {
       await ctx.reply([
         '可用命令：',
         '/new - 关闭当前对话，开启新对话',
+        '/exit - 关闭当前对话',
         '/help - 显示帮助',
         '',
         '直接发消息即可与 AI 对话',

@@ -1,24 +1,21 @@
 import * as fs from 'node:fs';
-import { createHash } from 'node:crypto';
 import { execSync } from 'node:child_process';
 import type { Delivery, CompatResult, DeliveryConfig, ProcessResult, AIBackend, MessageContext } from '../../interfaces/index.js';
 import { TerminalSessions } from './terminal-sessions.js';
 import { tryInject, createWindow } from './applescript.js';
-import { sleep } from '../../shared/utils.js';
-import { log } from '../../shared/logger.js';
+import { sleep, contextPathForUser } from '../../shared/utils.js';
+import { log, logError } from '../../shared/logger.js';
 import { userIdToSessionUUID } from '../../../utils.js';
 
 const PORT = parseInt(process.env.CC2WECHAT_PORT ?? '18081', 10);
 
-/** 根据 userId 生成隔离的 context 文件路径 */
-function contextPathForUser(userId: string): string {
-  const hash = createHash('md5').update(userId).digest('hex').slice(0, 8);
-  return `/tmp/cc2wechat-ctx-${hash}.json`;
-}
+const DEFAULT_STALE_TIMEOUT_MS = 24 * 3600 * 1000;
+const CLEANUP_INTERVAL_MS = 10 * 60 * 1000; // run cleanup every 10 minutes
 
 export class TerminalDelivery implements Delivery {
   readonly name = 'terminal';
   private sessions = new TerminalSessions(PORT);
+  private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
   async checkCompatibility(): Promise<CompatResult> {
     if (process.platform !== 'darwin') {
@@ -30,10 +27,20 @@ export class TerminalDelivery implements Delivery {
     return { available: true };
   }
 
-  async initialize(_config: DeliveryConfig): Promise<void> {}
+  async initialize(config: DeliveryConfig): Promise<void> {
+    const staleTimeout = (config as { session?: { staleTimeoutMs?: number } }).session?.staleTimeoutMs
+      ?? DEFAULT_STALE_TIMEOUT_MS;
+    // Run cleanup on a timer instead of blocking every deliver() call
+    this.cleanupTimer = setInterval(() => {
+      this.sessions.cleanupStale(staleTimeout).catch((err) => {
+        logError(`Session cleanup failed: ${String(err)}`);
+      });
+    }, CLEANUP_INTERVAL_MS);
+    // Also run once immediately
+    await this.sessions.cleanupStale(staleTimeout);
+  }
 
   async deliver(ctx: MessageContext, backend: AIBackend): Promise<ProcessResult> {
-    await this.sessions.cleanupStale(24 * 3600 * 1000);
     const entry = await this.sessions.findSession(ctx.userId);
 
     if (entry) {
@@ -82,7 +89,9 @@ export class TerminalDelivery implements Delivery {
             end repeat
           end tell
         '`, { timeout: 5000 });
-      } catch { /* already closed */ }
+      } catch (err) {
+        logError(`Failed to close iTerm session for user ${userId.slice(0, 8)}: ${String(err)}`);
+      }
       await this.sessions.destroySession(userId);
       log(`-> session closed: user=${userId.slice(0, 8)}`);
     }
@@ -92,7 +101,12 @@ export class TerminalDelivery implements Delivery {
     await this._createWindow(userId, backend, cwd);
   }
 
-  async shutdown(): Promise<void> {}
+  async shutdown(): Promise<void> {
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = null;
+    }
+  }
 
   /** 内部：创建 iTerm 窗口 + 注册 session */
   private async _createWindow(userId: string, backend: AIBackend, cwd: string): Promise<void> {

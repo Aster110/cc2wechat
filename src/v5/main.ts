@@ -11,6 +11,7 @@ import { MessageItemType } from '../types.js';
 import type { WeixinMessage } from '../types.js';
 import type { AccountData } from '../store.js';
 import { extractText, userIdToSessionUUID, log, logError } from '../utils.js';
+import { contextPathForUser } from './shared/utils.js';
 
 import { loadConfig } from './core/config.js';
 import { selectDelivery } from './core/bootstrap.js';
@@ -126,11 +127,6 @@ async function sendTypingIndicator(account: AccountData, userId: string, context
   } catch {
     // non-critical
   }
-}
-
-function contextPathForUser(userId: string): string {
-  const hash = createHash('md5').update(userId).digest('hex').slice(0, 8);
-  return `/tmp/cc2wechat-ctx-${hash}.json`;
 }
 
 function writeReplyContext(account: AccountData, userId: string, contextToken: string): string {
@@ -331,6 +327,8 @@ async function main(): Promise<void> {
   });
   const router = new Router(delivery, backend, replier);
 
+  const cwd = config.cwd ?? process.cwd();
+  console.log(`  Working directory: ${cwd}`);
   console.log(`  Health check: http://localhost:${HEALTH_PORT}/health`);
   console.log('  Listening for WeChat messages...\n');
 
@@ -377,8 +375,6 @@ async function main(): Promise<void> {
     log(`Health server on :${HEALTH_PORT}`);
   });
 
-  const cwd = config.cwd ?? process.cwd();
-  console.log(`  Working directory: ${cwd}`);
   await pollLoop(account, router, cwd, delivery, backend);
 }
 
