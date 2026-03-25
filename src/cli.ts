@@ -302,8 +302,11 @@ async function status(): Promise<void> {
     try {
       const res = await fetch(`http://localhost:${port}/health`);
       if (res.ok) {
-        const data = await res.json() as { status: string; uptime: number };
+        const data = await res.json() as { status: string; uptime: number; cwd?: string };
         console.log(`  Daemon: ✅ running (uptime ${formatUptime(data.uptime)})`);
+        if (data.cwd) {
+          console.log(`  CWD: ${data.cwd}`);
+        }
 
         const tabsPath = `/tmp/cc2wechat-tabs-${port}.json`;
         if (fs.existsSync(tabsPath)) {

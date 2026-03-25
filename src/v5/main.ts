@@ -347,6 +347,7 @@ async function main(): Promise<void> {
         backend: backend.name,
         startedAt,
         uptime: process.uptime(),
+        cwd,
       }));
     } else if (req.url === '/close-session' && req.method === 'POST') {
       // CC 调 cc2wechat --end 时，通过 Delivery 接口关闭会话（零平台特定代码）
