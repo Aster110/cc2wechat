@@ -55,13 +55,21 @@ export class CommandGateway {
 export function createDefaultGateway(): CommandGateway {
   const gw = new CommandGateway();
 
-  // /new → 关旧窗口 + 立刻开新窗口
+  // /new → 优先 reset（注入 /clear，不杀 session），fallback 到 close+create
   gw.register(['/new'], {
     description: 'new session',
     handler: async (ctx) => {
-      await ctx.closeSession(ctx.userId);
-      await ctx.createNewSession(ctx.userId);
-      await ctx.reply('已开启新对话 ✨');
+      const reset = ctx.delivery.resetSession
+        ? await ctx.delivery.resetSession(ctx.userId)
+        : false;
+
+      if (reset) {
+        await ctx.reply('已清空对话 ✨');
+      } else {
+        await ctx.closeSession(ctx.userId);
+        await ctx.createNewSession(ctx.userId);
+        await ctx.reply('已开启新对话 ✨');
+      }
     },
   });
 

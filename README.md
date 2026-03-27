@@ -76,6 +76,36 @@ cc2wechat --file /tmp/f.pdf    Send file
 cc2wechat help                 Show help
 ```
 
+## Configuration
+
+Optional config file at `~/.claude/channels/wechat-channel/config.json`:
+
+```json
+{
+  "delivery": "auto",
+  "backend": "claude-code",
+  "port": 18081
+}
+```
+
+### Delivery modes
+
+| Value | Behavior |
+|-------|----------|
+| `"auto"` | Auto-detect: iTerm (macOS) > tmux > SDK > Pipe |
+| `"terminal"` | Force macOS iTerm AppleScript |
+| `"tmux"` | Force tmux session management (requires `tmux` installed) |
+| `"sdk"` | Force Claude Agent SDK |
+| `"pipe"` | Force CLI stdin/stdout pipe |
+
+To force tmux delivery on macOS (useful for headless/SSH):
+
+```json
+{
+  "delivery": "tmux"
+}
+```
+
 ## How It Works
 
 ```
@@ -87,7 +117,7 @@ WeChat App  <--  iLink Bot API (send)       <--  Reply via WeChat API
 
 - **No public IP needed** — runs entirely on your local machine
 - **No cloud server** — WeChat messages are polled directly from iLink API
-- **Multi-session** — each WeChat user gets their own Claude Code session (iTerm window on macOS)
+- **Multi-session** — each WeChat user gets their own Claude Code session (iTerm on macOS, tmux on Linux)
 - **Auto markdown strip** — Claude's markdown output is cleaned for WeChat plain text
 - **Auto chunking** — long messages are split at 3900 chars
 
@@ -97,6 +127,7 @@ Delivery x Backend decoupled architecture:
 
 - **Delivery**: how to send messages to Claude Code
   - Terminal (macOS iTerm AppleScript injection)
+  - Tmux (Linux/macOS tmux session management)
   - SDK (Claude Agent SDK, cross-platform)
   - Pipe (CLI stdin/stdout)
 - **Backend**: which AI to use (Claude Code, extensible)
@@ -107,7 +138,8 @@ Delivery x Backend decoupled architecture:
 - Node.js >= 22
 - Claude Code CLI installed
 - macOS recommended (iTerm delivery for best experience)
-- Works on Linux/Windows via SDK delivery (fallback)
+- Linux supported via tmux delivery (install tmux first)
+- Falls back to SDK/Pipe delivery if neither iTerm nor tmux available
 
 ## License
 

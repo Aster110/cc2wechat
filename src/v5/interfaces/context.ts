@@ -7,4 +7,5 @@ export interface MessageContext {
   rawMessage: unknown;
   account: unknown;
   cwd: string;
+  accountName?: string;
 }

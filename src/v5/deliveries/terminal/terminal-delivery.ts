@@ -40,7 +40,7 @@ export class TerminalDelivery implements Delivery {
       const ok = tryInject(
         entry.platformData.sessionId as string,
         entry.platformData.windowId as string,
-        `[微信] ${ctx.text}`,
+        `[微信${ctx.accountName ? `·${ctx.accountName}` : ''}] ${ctx.text}`,
       );
       if (ok) {
         log(`-> injected: user=${ctx.userId.slice(0, 8)}, session=${(entry.platformData.sessionId as string).slice(0, 8)}`);
@@ -57,7 +57,7 @@ export class TerminalDelivery implements Delivery {
     // 新窗口第一条消息带回复指引
     const newEntry = await this.sessions.findSession(ctx.userId);
     if (newEntry) {
-      const firstMsg = `[微信] ${ctx.text}\n\n(收到微信消息，处理完后用 cc2wechat --text "你的回复" 发回微信)`;
+      const firstMsg = `[微信${ctx.accountName ? `·${ctx.accountName}` : ''}] ${ctx.text}\n\n(收到微信消息，处理完后用 cc2wechat --text "你的回复" 发回微信)`;
       tryInject(newEntry.platformData.sessionId as string, newEntry.platformData.windowId as string, firstMsg);
     }
 

@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
 import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
 import http from 'node:http';
 import { createHash } from 'node:crypto';
 
@@ -21,6 +23,7 @@ import { ClaudeCodeBackend } from './backends/claude-code.js';
 import { TerminalDelivery } from './deliveries/terminal/terminal-delivery.js';
 import { SDKDelivery } from './deliveries/sdk/sdk-delivery.js';
 import { PipeDelivery } from './deliveries/pipe/pipe-delivery.js';
+import { TmuxDelivery } from './deliveries/tmux/tmux-delivery.js';
 import type { MessageSender, MessageContext, Delivery, AIBackend } from './interfaces/index.js';
 
 // ---------------------------------------------------------------------------
@@ -166,7 +169,7 @@ async function isPortInUse(port: number): Promise<number | null> {
 
 const commandGateway = createDefaultGateway();
 
-async function pollLoop(account: AccountData, router: Router, cwd: string, delivery: Delivery, backend: AIBackend): Promise<void> {
+async function pollLoop(account: AccountData, router: Router, cwd: string, delivery: Delivery, backend: AIBackend, accountName?: string): Promise<void> {
   let buf = loadSyncBuf(account.accountId);
   let consecutiveFailures = 0;
   let nextTimeoutMs = 35_000;
@@ -254,6 +257,7 @@ async function pollLoop(account: AccountData, router: Router, cwd: string, deliv
           rawMessage: msg,
           account,
           cwd,
+          accountName: accountName ?? undefined,
         };
 
         await router.handle(ctx);
@@ -279,6 +283,18 @@ async function pollLoop(account: AccountData, router: Router, cwd: string, deliv
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
+
+/** Reverse-lookup account name from aliases.json by port */
+function getAccountName(port: number): string | null {
+  try {
+    const raw = fs.readFileSync(path.join(os.homedir(), '.cc2wechat', 'aliases.json'), 'utf-8');
+    const aliases = JSON.parse(raw) as Record<string, number>;
+    for (const [name, p] of Object.entries(aliases)) {
+      if (p === port) return name;
+    }
+  } catch { /* no aliases */ }
+  return null;
+}
 
 async function main(): Promise<void> {
   console.log('\n  cc2wechat v5 — Delivery x Backend Architecture\n');
@@ -307,7 +323,8 @@ async function main(): Promise<void> {
     account = getActiveAccount(HEALTH_PORT)!;
   }
 
-  console.log(`  Account: ${account.accountId}`);
+  const accountName = getAccountName(HEALTH_PORT);
+  console.log(`  Account: ${account.accountId}${accountName ? ` (${accountName})` : ''}`);
 
   // Load config
   const config = loadConfig();
@@ -316,6 +333,7 @@ async function main(): Promise<void> {
   const backend = new ClaudeCodeBackend();
   const candidates = [
     new TerminalDelivery(),
+    new TmuxDelivery(),
     new SDKDelivery(),
     new PipeDelivery(),
   ];
@@ -379,7 +397,7 @@ async function main(): Promise<void> {
 
   const cwd = config.cwd ?? process.cwd();
   console.log(`  Working directory: ${cwd}`);
-  await pollLoop(account, router, cwd, delivery, backend);
+  await pollLoop(account, router, cwd, delivery, backend, accountName ?? undefined);
 }
 
 main().catch((err) => {

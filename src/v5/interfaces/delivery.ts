@@ -26,5 +26,7 @@ export interface Delivery {
   closeSession(userId: string): Promise<void>;
   /** 创建新会话（不注入消息） */
   createSession(userId: string, backend: AIBackend, cwd: string, contextPath?: string): Promise<void>;
+  /** 重置会话（清上下文但不销毁进程）。默认 = close + create，tmux 覆写为注入 /clear */
+  resetSession?(userId: string): Promise<boolean>;
   shutdown(): Promise<void>;
 }
