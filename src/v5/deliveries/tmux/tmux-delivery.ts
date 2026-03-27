@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { execSync, spawn } from 'node:child_process';
 import type { Delivery, CompatResult, DeliveryConfig, ProcessResult, AIBackend, MessageContext } from '../../interfaces/index.js';
 import { TmuxSessions } from './tmux-sessions.js';
 import { hasTmux, sendToSession, createTmuxSession, killTmuxSession, isTmuxSessionAlive } from './tmux-cli.js';
@@ -108,6 +109,7 @@ export class TmuxDelivery implements Delivery {
     const entry = await this.sessions.findSession(userId);
     if (entry?.platformData?.sessionName) {
       killTmuxSession(entry.platformData.sessionName as string);
+      this._killTtyd(userId);
       await this.sessions.destroySession(userId);
       log(`-> tmux session closed: user=${userId.slice(0, 8)}`);
     }
@@ -123,6 +125,7 @@ export class TmuxDelivery implements Delivery {
       if (entry.platformData?.sessionName) {
         killTmuxSession(entry.platformData.sessionName as string);
       }
+      this._killTtyd(entry.userId);
     }
     // 清理 session store + 磁盘文件，避免重启后加载过期记录
     for (const entry of all) {
@@ -172,13 +175,64 @@ export class TmuxDelivery implements Delivery {
       createTmuxSession(sessionName, cwd, fullCmd);
 
       await sleep(10000);
+
+      // 自动启动 ttyd Web 终端（只读模式），让用户在浏览器看 Claude Code
+      const ttydPort = this._startTtyd(sessionName, userId);
+
       await this.sessions.createSession(userId, {
         sessionId,
         cwd,
-        platformData: { sessionName },
+        platformData: { sessionName, ttydPort },
       });
     } finally {
       this.creatingUsers.delete(userId);
+    }
+  }
+
+  /** ttyd 进程管理 */
+  private ttydProcesses = new Map<string, { port: number; kill: () => void }>();
+
+  /** 为 tmux session 启动 ttyd Web 终端 */
+  private _startTtyd(sessionName: string, userId: string): number | null {
+    try {
+      execSync('which ttyd', { encoding: 'utf-8', timeout: 3000 });
+    } catch {
+      return null; // ttyd 没安装，跳过
+    }
+
+    // 基于 userId hash 分配端口（7681 起步）
+    const hash = createHash('md5').update(userId).digest('hex');
+    const port = 7681 + (parseInt(hash.slice(0, 4), 16) % 1000);
+
+    // 杀掉旧的 ttyd（如果有）
+    this._killTtyd(userId);
+
+    try {
+      const child = spawn('ttyd', ['-W', '-p', String(port), 'tmux', 'attach', '-t', sessionName], {
+        detached: true,
+        stdio: 'ignore',
+      });
+      child.unref();
+
+      this.ttydProcesses.set(userId, {
+        port,
+        kill: () => { try { child.kill(); } catch { /* ok */ } },
+      });
+
+      log(`-> ttyd started: http://localhost:${port} (user=${userId.slice(0, 8)})`);
+      return port;
+    } catch (err) {
+      log(`-> ttyd failed to start: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    }
+  }
+
+  /** 关闭用户的 ttyd */
+  private _killTtyd(userId: string): void {
+    const entry = this.ttydProcesses.get(userId);
+    if (entry) {
+      entry.kill();
+      this.ttydProcesses.delete(userId);
     }
   }
 }

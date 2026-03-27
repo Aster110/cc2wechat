@@ -103,6 +103,11 @@ function printUsage(): void {
     cc2wechat rename old new     Rename an account
     cc2wechat status             Show all accounts & daemons
 
+  Web Terminal (tmux delivery):
+    cc2wechat web [name]           Open Web terminal in browser
+    cc2wechat web [name] --readonly  Read-only mode
+    cc2wechat web [name] --port N  Custom port (default: 7681)
+
   Reply (requires running daemon):
     cc2wechat --text "你好"       Send text to current WeChat context
     cc2wechat --image /tmp/s.png  Send image
@@ -113,9 +118,11 @@ function printUsage(): void {
     cc2wechat login --name wife      # Second account (auto port 18082)
     cc2wechat start aster            # Start one
     cc2wechat start                  # Start all
+    cc2wechat web aster              # Open Web terminal
     cc2wechat status                 # Show all
 
   cc2wechat help                 Show this help
+  cc2wechat --version            Show version
 `);
 }
 
@@ -329,6 +336,83 @@ async function status(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Web terminal (ttyd)
+// ---------------------------------------------------------------------------
+
+async function openWeb(name?: string, opts?: { readonly?: boolean; port?: number }): Promise<void> {
+  // 找 tmux session
+  const port = name ? resolvePort(name) : parseInt(process.env.CC2WECHAT_PORT ?? String(BASE_PORT), 10);
+  const displayName = name ?? reverseAlias(port) ?? `port-${port}`;
+  const tmuxFile = `/tmp/cc2wechat-tmux-${port}.json`;
+
+  let sessionName: string | null = null;
+  try {
+    const data = JSON.parse(fs.readFileSync(tmuxFile, 'utf-8'));
+    const entries = Object.values(data) as Array<{ platformData?: { sessionName?: string } }>;
+    if (entries.length > 0 && entries[0]?.platformData?.sessionName) {
+      sessionName = entries[0].platformData.sessionName;
+    }
+  } catch { /* no session file */ }
+
+  if (!sessionName) {
+    // 没有 tmux session 注册表，尝试直接找 cc2w- 开头的
+    try {
+      const list = execSync('tmux list-sessions -F "#{session_name}" 2>/dev/null', { encoding: 'utf-8' });
+      const sessions = list.trim().split('\n').filter(s => s.startsWith('cc2w-'));
+      if (sessions.length > 0) {
+        sessionName = sessions[0];
+      }
+    } catch { /* no tmux server */ }
+  }
+
+  if (!sessionName) {
+    console.log(`  ❌ 没有找到 ${displayName} 的 tmux session`);
+    console.log('  先发一条微信消息创建 session，或确认 daemon 使用 tmux delivery');
+    return;
+  }
+
+  // 确定 ttyd 端口
+  const ttydPort = opts?.port || 7681;
+  const readonlyFlag = opts?.readonly ? [] : ['-W'];
+
+  // 检查 ttyd 是否安装
+  try {
+    execSync('which ttyd', { encoding: 'utf-8', timeout: 3000 });
+  } catch {
+    console.log('  ❌ ttyd 未安装');
+    console.log('  安装: brew install ttyd (macOS) 或 apt install ttyd (Linux)');
+    return;
+  }
+
+  // 杀掉该端口上旧的 ttyd
+  try {
+    const pid = execSync(`lsof -i :${ttydPort} -t -sTCP:LISTEN 2>/dev/null`, { encoding: 'utf-8' }).trim();
+    if (pid) {
+      process.kill(parseInt(pid, 10), 'SIGTERM');
+    }
+  } catch { /* not running */ }
+
+  // 启动 ttyd
+  const { spawn: spawnChild } = await import('node:child_process');
+  const child = spawnChild('ttyd', [...readonlyFlag, '-p', String(ttydPort), 'tmux', 'attach', '-t', sessionName], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+
+  const url = `http://localhost:${ttydPort}`;
+  console.log(`  🖥️  Web terminal: ${url}`);
+  console.log(`  Session: ${sessionName} (${displayName})`);
+  console.log(`  Mode: ${opts?.readonly ? '只读' : '可编辑'}`);
+
+  // 自动打开浏览器
+  const openCmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
+  try {
+    execSync(`${openCmd} ${url}`, { timeout: 5000 });
+  } catch { /* 非关键 */ }
+}
+
+// ---------------------------------------------------------------------------
 // Command dispatch
 // ---------------------------------------------------------------------------
 
@@ -422,12 +506,30 @@ switch (command) {
     status().catch(console.error);
     break;
 
+  case 'web': {
+    // cc2wechat web [name] [--readonly] [--port XXXX]
+    const webName = targetName;
+    const readonly = args.includes('--readonly') || args.includes('-r');
+    const portIdx = args.indexOf('--port');
+    const customPort = portIdx >= 0 ? parseInt(args[portIdx + 1], 10) : 0;
+    openWeb(webName, { readonly, port: customPort }).catch(console.error);
+    break;
+  }
+
   case 'help':
   case '--help':
   case '-h':
   case undefined:
     printUsage();
     break;
+
+  case 'version':
+  case '--version':
+  case '-v': {
+    const pkg = JSON.parse(fs.readFileSync(path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'package.json'), 'utf-8'));
+    console.log(pkg.version);
+    break;
+  }
 
   default:
     console.error(`  Unknown command: ${command}`);
