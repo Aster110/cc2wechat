@@ -73,7 +73,9 @@ cc2wechat --text "hello"       Reply to current WeChat context
 cc2wechat --image /tmp/s.png   Send image
 cc2wechat --file /tmp/f.pdf    Send file
 
+cc2wechat web [name]           Open ttyd Web Terminal in browser
 cc2wechat help                 Show help
+cc2wechat --version            Show version
 ```
 
 ## Configuration
@@ -94,7 +96,7 @@ Optional config file at `~/.claude/channels/wechat-channel/config.json`:
 |-------|----------|
 | `"auto"` | Auto-detect: iTerm (macOS) > tmux > SDK > Pipe |
 | `"terminal"` | Force macOS iTerm AppleScript |
-| `"tmux"` | Force tmux session management (requires `tmux` installed) |
+| `"tmux"` | Force tmux session management (requires `tmux` installed). Auto-starts ttyd Web Terminal for browser access. |
 | `"sdk"` | Force Claude Agent SDK |
 | `"pipe"` | Force CLI stdin/stdout pipe |
 
@@ -109,10 +111,11 @@ To force tmux delivery on macOS (useful for headless/SSH):
 ## How It Works
 
 ```
-WeChat App  -->  iLink Bot API (long-poll)  -->  cc2wechat daemon  -->  Claude Code
-                                                      |
-                                                      v
-WeChat App  <--  iLink Bot API (send)       <--  Reply via WeChat API
+WeChat App  -->  iLink Bot API (long-poll)  -->  cc2wechat daemon  -->  Claude Code (tmux)
+                                                      |                       |
+                                                      v                       v
+WeChat App  <--  iLink Bot API (send)       <--  Reply via WeChat API   ttyd Web Terminal
+                                                                        (browser access)
 ```
 
 - **No public IP needed** — runs entirely on your local machine
@@ -132,6 +135,19 @@ Delivery x Backend decoupled architecture:
   - Pipe (CLI stdin/stdout)
 - **Backend**: which AI to use (Claude Code, extensible)
 - **Router**: zero if/else at runtime, everything resolved at boot
+
+## Web Terminal
+
+When using tmux delivery, cc2wechat can expose Claude Code sessions via [ttyd](https://github.com/tsl0922/ttyd) Web Terminal, allowing you to watch or interact with Claude Code from a browser.
+
+```bash
+# Open web terminal for a specific account
+cc2wechat web myname
+```
+
+The daemon automatically starts a ttyd instance for each tmux session. The URL is shown in `cc2wechat status` output.
+
+**Note**: ttyd 1.7.7+ defaults to read-only mode. The daemon starts ttyd with `-W` flag to enable write access. Install ttyd via `brew install ttyd` (macOS) or your package manager.
 
 ## Requirements
 

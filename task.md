@@ -76,3 +76,19 @@
 - **现象**：`sendToSession` 的 tmpFile 用 `Date.now()` 命名，同毫秒两次调用会写同一文件
 - **影响**：极低概率下两条消息内容互相覆盖
 - **建议**：加 `Math.random()` 后缀或用 `crypto.randomUUID()`，暂不修复
+
+---
+
+## v5.0.2 新增功能（2026-03-28）
+
+### ttyd Web Terminal 集成
+- [x] daemon 启动时自动为 tmux session 启动 ttyd Web Terminal
+- [x] `cc2wechat web [name]` 命令：在浏览器中打开 Web Terminal
+- [x] `cc2wechat --version` 显示版本号
+- [x] ttyd 使用 `-W` 参数启用可写模式（ttyd 1.7.7+ 默认只读）
+
+### 验收状态
+- [x] 编译通过 (`npm run build`)
+- [x] 踩坑文档已补充（ttyd 只读模式、端口冲突）
+- [x] README 架构图已更新（含 ttyd Web Terminal）
+- [x] README 加 Web Terminal 使用说明 + --version 说明

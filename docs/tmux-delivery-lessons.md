@@ -116,3 +116,34 @@ const fullCmd = `CC2WECHAT_CONTEXT=${ctxPath} claude --dangerously-skip-permissi
 1. 在 CI 里加一步用 `node --input-type=module` 直接跑入口文件做冒烟测试
 2. ESLint 规则禁止 `require()`（`no-restricted-globals` 或 `@typescript-eslint/no-require-imports`）
 3. 代码审查时对 ESM 项目里出现的 `require` 保持警觉
+
+## 12. ttyd 1.7.7 默认只读模式
+
+**场景**：部署 ttyd Web Terminal 让用户通过浏览器访问 tmux session。
+
+**陷阱**：ttyd 1.7.7 开始默认是**只读模式**。很多人以为加 `-R` 是开启只读，实际上 `-R` 是老版本的参数，新版本默认就是只读。要开启**可写**（允许用户在浏览器里输入），必须加 `-W` 参数。
+
+**正确用法**：
+```bash
+# 可读可写（允许浏览器输入）
+ttyd -W tmux attach -t session-name
+
+# 只读（默认行为，不加 -W 即可）
+ttyd tmux attach -t session-name
+```
+
+**教训**：升级 ttyd 后一定看 changelog，默认行为变了。如果浏览器能看到终端但打不了字，先检查是不是缺 `-W`。
+
+## 13. daemon 自动启动的 ttyd 与 CLI web 命令端口冲突
+
+**场景**：`cc2wechat start` 启动 daemon 时会自动为每个 tmux session 启动 ttyd Web Terminal。同时 `cc2wechat web` 命令也可以手动启动 ttyd。
+
+**现象**：如果 daemon 已经在某个端口（比如 7682）启动了 ttyd，再手动执行 `cc2wechat web` 会因为端口被占用而失败：`Address already in use`。
+
+**根因**：两个入口（daemon 自动启动 + CLI 手动启动）都试图绑定同一个端口，没有做端口占用检测。
+
+**建议**：
+- 启动 ttyd 前先检测目标端口是否已被占用（`lsof -i :PORT`）
+- 如果已占用且是自己的 ttyd 进程，直接复用
+- 如果已占用且是别的进程，自动递增端口或报错提示
+- daemon 自动启动的 ttyd 信息应写入状态文件，CLI 命令读取后直接打开已有地址
