@@ -6,7 +6,7 @@ import os from 'node:os';
 import http from 'node:http';
 import { createHash } from 'node:crypto';
 
-import { loginWithQRWeb } from '../auth.js';
+import { loginWithQR, loginWithQRWeb } from '../auth.js';
 import { getActiveAccount, saveAccount, loadSyncBuf, saveSyncBuf } from '../store.js';
 import { getUpdates, sendTyping, getConfig, sendMessage, uploadAndSendMedia, downloadMedia } from '../wechat-api.js';
 import { MessageItemType } from '../types.js';
@@ -20,7 +20,6 @@ import { Router } from './core/router.js';
 import { createDefaultGateway } from './core/command-gateway.js';
 import { Replier } from './sender/replier.js';
 import { ClaudeCodeBackend } from './backends/claude-code.js';
-import { TerminalDelivery } from './deliveries/terminal/terminal-delivery.js';
 import { SDKDelivery } from './deliveries/sdk/sdk-delivery.js';
 import { PipeDelivery } from './deliveries/pipe/pipe-delivery.js';
 import { TmuxDelivery } from './deliveries/tmux/tmux-delivery.js';
@@ -312,7 +311,8 @@ async function main(): Promise<void> {
   let account = getActiveAccount(HEALTH_PORT);
   if (!account) {
     console.log('  No saved credentials. Starting login...');
-    const result = await loginWithQRWeb();
+    const isHeadless = !process.env.DISPLAY && !process.env.BROWSER && process.platform !== 'darwin';
+    const result = isHeadless ? await loginWithQR() : await loginWithQRWeb();
     saveAccount({
       accountId: result.accountId.replace(/@/g, '-').replace(/\./g, '-'),
       token: result.token,
@@ -332,7 +332,6 @@ async function main(): Promise<void> {
   // Bootstrap: select backend + delivery
   const backend = new ClaudeCodeBackend();
   const candidates = [
-    new TerminalDelivery(),
     new TmuxDelivery(),
     new SDKDelivery(),
     new PipeDelivery(),

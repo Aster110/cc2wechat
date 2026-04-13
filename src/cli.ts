@@ -4,7 +4,7 @@ import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { loginWithQRWeb } from './auth.js';
+import { loginWithQR, loginWithQRWeb } from './auth.js';
 import { saveAccount, getActiveAccount } from './store.js';
 import { sendMessage, uploadAndSendMedia } from './wechat-api.js';
 
@@ -201,7 +201,8 @@ async function login(): Promise<void> {
   process.env.CC2WECHAT_PORT = String(port);
   console.log(`\n  🦞 WeChat QR Login — "${name}" (port ${port})\n`);
   try {
-    const result = await loginWithQRWeb();
+    const isHeadless = !process.env.DISPLAY && !process.env.BROWSER && process.platform !== 'darwin';
+    const result = isHeadless ? await loginWithQR() : await loginWithQRWeb();
     saveAccount({
       accountId: result.accountId.replace(/@/g, '-').replace(/\./g, '-'),
       token: result.token,
