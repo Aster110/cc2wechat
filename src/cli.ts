@@ -7,6 +7,7 @@ import os from 'node:os';
 import { loginWithQR, loginWithQRWeb } from './auth.js';
 import { saveAccount, getActiveAccount } from './store.js';
 import { sendMessage, uploadAndSendMedia } from './wechat-api.js';
+import { installSkill } from './skill-install.js';
 
 // ---------------------------------------------------------------------------
 // Aliases: ~/.cc2wechat/aliases.json — maps friendly names to ports
@@ -112,6 +113,9 @@ function printUsage(): void {
     cc2wechat --text "你好"       Send text to current WeChat context
     cc2wechat --image /tmp/s.png  Send image
     cc2wechat --file /tmp/f.pdf   Send file
+
+  Skill:
+    cc2wechat skill install [--force]   Install the /cc2wechat skill to ~/.claude/skills/
 
   Examples:
     cc2wechat login --name aster     # First account
@@ -506,6 +510,27 @@ switch (command) {
   case 'status':
     status().catch(console.error);
     break;
+
+  case 'skill': {
+    if (targetName !== 'install') {
+      console.log('  Usage: cc2wechat skill install [--force]');
+      break;
+    }
+    const pkgRoot = path.join(path.dirname(new URL(import.meta.url).pathname), '..');
+    const force = args.includes('--force');
+    try {
+      const result = installSkill(pkgRoot, os.homedir(), 'cc2wechat', force);
+      if (result.installed) {
+        console.log(`  ✅ skill installed → ${result.dest}`);
+      } else {
+        console.log(`  Already exists: ${result.dest} (use --force to overwrite)`);
+      }
+    } catch (err) {
+      console.error(`  ${err instanceof Error ? err.message : err}`);
+      process.exit(1);
+    }
+    break;
+  }
 
   case 'web': {
     // cc2wechat web [name] [--readonly] [--port XXXX]
