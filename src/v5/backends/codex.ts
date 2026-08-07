@@ -55,11 +55,15 @@ export class CodexBackend implements AIBackend {
 
   async *chat(opts: ChatOpts): AsyncIterable<BackendEvent> {
     const thread = loadThreads()[opts.sessionId];
+    // 注意：`codex exec resume` 不支持 -C/--cd（只有 `codex exec` 有），
+    // 所以工作目录统一靠子进程 cwd 传，两条路径共用同一套旗子。
+    // `--` 兜住以 - 开头的用户输入，避免被当成旗子解析。
+    const flags = [BYPASS_FLAG, '--json', '--skip-git-repo-check'];
     const args = thread
-      ? [BYPASS_FLAG, 'exec', 'resume', thread, '--json', '--skip-git-repo-check', '-C', opts.cwd, opts.message]
-      : [BYPASS_FLAG, 'exec', '--json', '--skip-git-repo-check', '-C', opts.cwd, opts.message];
+      ? ['exec', 'resume', ...flags, '--', thread, opts.message]
+      : ['exec', ...flags, '--', opts.message];
 
-    const child = spawn('codex', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn('codex', args, { stdio: ['ignore', 'pipe', 'pipe'], cwd: opts.cwd });
     let stderrTail = '';
     child.stderr.on('data', (d: Buffer) => {
       stderrTail = (stderrTail + d.toString()).slice(-2000);
@@ -98,10 +102,12 @@ export class CodexBackend implements AIBackend {
   buildPipeCommand(opts: PipeOpts): string {
     const thread = loadThreads()[opts.sessionId];
     const outFile = `/tmp/codex-last-${process.env.CC2WECHAT_PORT ?? '18081'}.txt`;
+    const flags = `${BYPASS_FLAG} --skip-git-repo-check -o ${shellQuote(outFile)}`;
+    // 同 chat()：resume 不吃 -C，改用 cd 进工作目录
     const base = thread
-      ? `${codexEnvPrefix()}codex ${BYPASS_FLAG} exec resume ${thread}`
-      : `${codexEnvPrefix()}codex ${BYPASS_FLAG} exec`;
-    return `${base} --skip-git-repo-check -C ${shellQuote(opts.cwd)} -o ${shellQuote(outFile)} ${shellQuote(opts.prompt)} >/dev/null 2>&1; cat ${shellQuote(outFile)}`;
+      ? `${codexEnvPrefix()}codex exec resume ${flags} -- ${shellQuote(thread)} ${shellQuote(opts.prompt)}`
+      : `${codexEnvPrefix()}codex exec ${flags} -- ${shellQuote(opts.prompt)}`;
+    return `cd ${shellQuote(opts.cwd)} && ${base} >/dev/null 2>&1; cat ${shellQuote(outFile)}`;
   }
 
   extractResult(events: BackendEvent[]): string {
