@@ -34,6 +34,13 @@ function saveThread(sessionId: string, threadId: string): void {
   fs.writeFileSync(mapFile(), JSON.stringify(m, null, 2), 'utf-8');
 }
 
+function dropThread(sessionId: string): void {
+  const m = loadThreads();
+  if (!(sessionId in m)) return;
+  delete m[sessionId];
+  fs.writeFileSync(mapFile(), JSON.stringify(m, null, 2), 'utf-8');
+}
+
 function shellQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
@@ -44,6 +51,12 @@ function codexEnvPrefix(): string {
 
 export class CodexBackend implements AIBackend {
   readonly name = 'codex';
+
+  // /new、/exit 时丢掉 thread 绑定，下一条消息开全新 codex 会话。
+  // 不删 codex 自己的 rollout 文件（那是历史记录，用户可能还要翻）。
+  resetSession(sessionId: string): void {
+    dropThread(sessionId);
+  }
 
   buildLaunchCommand(opts: LaunchOpts): string {
     const thread = loadThreads()[opts.resumeSessionId ?? opts.sessionId];
