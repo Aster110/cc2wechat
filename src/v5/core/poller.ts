@@ -17,8 +17,19 @@ const RETRY_DELAY_MS = 2_000;
 const SESSION_PAUSE_MS = 5 * 60_000;
 /** "正在输入"心跳间隔。微信端的 typing 状态会自己过期，慢后端（codex 一轮几分钟）必须续。 */
 const TYPING_HEARTBEAT_MS = 15_000;
-/** 超过这个时间还没答完，先给用户一句"还在处理"，免得他以为掉线了。 */
-const SLOW_ACK_MS = 20_000;
+/**
+ * 超过这个时间还没答完，先给用户一句"还在处理"，免得他以为掉线了。
+ *
+ * 默认 60s：codex 这类后端一轮动辄半分钟起步，阈值定太低会**每条都触发**，
+ * 那就不是信号而是噪音了（"正在输入"心跳才是常态提示）。
+ * `CC2WECHAT_ACK_MS=0` 彻底关掉。
+ */
+function slowAckMs(): number {
+  const raw = process.env.CC2WECHAT_ACK_MS;
+  if (raw == null || raw === '') return 60_000;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 60_000;
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -95,9 +106,12 @@ export async function processMessage(msg: WeixinMessage, deps: ProcessMessageDep
   writeReplyContext(account, userId, contextToken);
 
   const stopTyping = startTypingHeartbeat(account, userId, contextToken);
-  const slowAck = setTimeout(() => {
-    sendMessage(account.token, userId, '收到，正在处理…', contextToken, account.baseUrl).catch(() => {});
-  }, SLOW_ACK_MS);
+  const ackMs = slowAckMs();
+  const slowAck = ackMs > 0
+    ? setTimeout(() => {
+        sendMessage(account.token, userId, '收到，正在处理…', contextToken, account.baseUrl).catch(() => {});
+      }, ackMs)
+    : null;
 
   const ctx: MessageContext & { mediaPaths: Map<number, string> } = {
     text,
@@ -115,7 +129,7 @@ export async function processMessage(msg: WeixinMessage, deps: ProcessMessageDep
   try {
     await router.handle(ctx);
   } finally {
-    clearTimeout(slowAck);
+    if (slowAck) clearTimeout(slowAck);
     stopTyping();
   }
 }
