@@ -49,6 +49,16 @@ function codexEnvPrefix(): string {
   return process.env.CODEX_HOME ? `CODEX_HOME=${shellQuote(process.env.CODEX_HOME)} ` : '';
 }
 
+/**
+ * 微信是聊天场景，等不起 xhigh 推理档（实测一轮 2~6 分钟）。
+ * 设 CC2WECHAT_CODEX_EFFORT 覆盖 config.toml 的 model_reasoning_effort；
+ * 不设就沿用 config.toml，不擅自改用户的默认档。
+ */
+function effortFlags(): string[] {
+  const effort = process.env.CC2WECHAT_CODEX_EFFORT;
+  return effort ? ['-c', `model_reasoning_effort="${effort}"`] : [];
+}
+
 export class CodexBackend implements AIBackend {
   readonly name = 'codex';
 
@@ -71,7 +81,7 @@ export class CodexBackend implements AIBackend {
     // 注意：`codex exec resume` 不支持 -C/--cd（只有 `codex exec` 有），
     // 所以工作目录统一靠子进程 cwd 传，两条路径共用同一套旗子。
     // `--` 兜住以 - 开头的用户输入，避免被当成旗子解析。
-    const flags = [BYPASS_FLAG, '--json', '--skip-git-repo-check'];
+    const flags = [BYPASS_FLAG, '--json', '--skip-git-repo-check', ...effortFlags()];
     const args = thread
       ? ['exec', 'resume', ...flags, '--', thread, opts.message]
       : ['exec', ...flags, '--', opts.message];
@@ -81,7 +91,11 @@ export class CodexBackend implements AIBackend {
     child.stderr.on('data', (d: Buffer) => {
       stderrTail = (stderrTail + d.toString()).slice(-2000);
     });
-    const killer = setTimeout(() => child.kill('SIGKILL'), CHAT_TIMEOUT_MS);
+    let timedOut = false;
+    const killer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, CHAT_TIMEOUT_MS);
 
     try {
       const rl = readline.createInterface({ input: child.stdout });
@@ -103,7 +117,13 @@ export class CodexBackend implements AIBackend {
         child.on('close', (c) => resolve(c ?? 0));
         if (child.exitCode != null) resolve(child.exitCode);
       });
-      if (code !== 0) {
+      if (timedOut) {
+        // SIGKILL 后 close code 是 null，不特判就会变成沉默的 "[No response]"
+        yield {
+          type: 'error',
+          message: `这轮超过 ${Math.round(CHAT_TIMEOUT_MS / 60_000)} 分钟没跑完，已中止。把任务拆小一点再试。`,
+        };
+      } else if (code !== 0) {
         yield { type: 'error', message: `codex exited ${code}: ${stderrTail.slice(-300)}` };
       }
     } finally {
@@ -115,7 +135,8 @@ export class CodexBackend implements AIBackend {
   buildPipeCommand(opts: PipeOpts): string {
     const thread = loadThreads()[opts.sessionId];
     const outFile = `/tmp/codex-last-${process.env.CC2WECHAT_PORT ?? '18081'}.txt`;
-    const flags = `${BYPASS_FLAG} --skip-git-repo-check -o ${shellQuote(outFile)}`;
+    const effort = effortFlags().map(shellQuote).join(' ');
+    const flags = `${BYPASS_FLAG} --skip-git-repo-check${effort ? ' ' + effort : ''} -o ${shellQuote(outFile)}`;
     // 同 chat()：resume 不吃 -C，改用 cd 进工作目录
     const base = thread
       ? `${codexEnvPrefix()}codex exec resume ${flags} -- ${shellQuote(thread)} ${shellQuote(opts.prompt)}`
