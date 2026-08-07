@@ -9,6 +9,8 @@
   },
   "bin": {
     "cc2wechat": "dist/cli.js",
+    "cx2wechat": "dist/cli-codex.js",
+    "codex2wechat": "dist/cli-codex.js",
     "cc2wechat-reply": "dist/reply-cli.js",
     "wechat-cc-channel": "dist/server.js"
   },
