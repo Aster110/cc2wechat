@@ -17,6 +17,7 @@ import { pollLoop } from './core/poller.js';
 import { Replier } from './sender/replier.js';
 import { createWeChatSender } from './sender/wechat-sender.js';
 import { ClaudeCodeBackend } from './backends/claude-code.js';
+import { CodexBackend } from './backends/codex.js';
 import { SDKDelivery } from './deliveries/sdk/sdk-delivery.js';
 import { PipeDelivery } from './deliveries/pipe/pipe-delivery.js';
 import { TmuxDelivery } from './deliveries/tmux/tmux-delivery.js';
@@ -75,9 +76,11 @@ async function main(): Promise<void> {
 
   const config = loadConfig();
 
-  const backend = new ClaudeCodeBackend();
+  // 后端/投递可用环境变量覆盖（单账号试点用，不动全局 config.json）
+  const backendName = process.env.CC2WECHAT_BACKEND ?? config.backend;
+  const backend = backendName === 'codex' ? new CodexBackend() : new ClaudeCodeBackend();
   const candidates = [new TmuxDelivery(), new SDKDelivery(), new PipeDelivery()];
-  const delivery = await selectDelivery(candidates, config.delivery);
+  const delivery = await selectDelivery(candidates, process.env.CC2WECHAT_DELIVERY ?? config.delivery);
   await delivery.initialize(config as unknown as Record<string, unknown>);
   log(`Delivery: ${delivery.name}, Backend: ${backend.name}`);
 

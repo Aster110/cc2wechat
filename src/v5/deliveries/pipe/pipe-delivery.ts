@@ -1,8 +1,11 @@
 import { execSync } from 'node:child_process';
+import { userIdToSessionUUID } from '../../../utils.js';
 import type { Delivery, CompatResult, DeliveryConfig, ProcessResult, AIBackend, MessageContext } from '../../interfaces/index.js';
 
 export class PipeDelivery implements Delivery {
   readonly name = 'pipe';
+  // 同 SDKDelivery：无进程可关，靠后端自己丢弃会话绑定
+  private lastBackend: AIBackend | null = null;
 
   async checkCompatibility(): Promise<CompatResult> {
     try {
@@ -16,6 +19,7 @@ export class PipeDelivery implements Delivery {
   async initialize(_config: DeliveryConfig): Promise<void> {}
 
   async deliver(ctx: MessageContext, backend: AIBackend): Promise<ProcessResult> {
+    this.lastBackend = backend;
     const cmd = backend.buildPipeCommand({
       prompt: ctx.text,
       sessionId: ctx.sessionId,
@@ -30,7 +34,14 @@ export class PipeDelivery implements Delivery {
     return { text: result || '[No response]', selfReplied: false };
   }
 
-  async closeSession(_userId: string): Promise<void> {}
-  async createSession(_userId: string, _backend: AIBackend, _cwd: string): Promise<void> {}
+  async closeSession(userId: string): Promise<void> {
+    await this.lastBackend?.resetSession?.(userIdToSessionUUID(userId));
+  }
+
+  async createSession(userId: string, backend: AIBackend, _cwd: string): Promise<void> {
+    this.lastBackend = backend;
+    await backend.resetSession?.(userIdToSessionUUID(userId));
+  }
+
   async shutdown(): Promise<void> {}
 }
