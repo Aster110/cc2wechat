@@ -151,15 +151,21 @@ export class CodexBackend implements AIBackend {
         if (item?.type === 'agent_message' && typeof item.text === 'string') return item.text;
       }
     }
-    for (const event of [...events].reverse()) {
-      if (event.type === 'turn.failed') {
-        const err = event.error as { message?: string } | undefined;
-        if (err?.message) return `[codex] ${err.message}`;
-      }
-      if (event.type === 'error' && typeof event.message === 'string') {
-        return `[codex] ${event.message}`;
-      }
+    // 语义错误优先于进程噪音：codex 退出前常把 skill 加载警告之类的东西写进 stderr，
+    // 那条 `codex exited N: ...` 事件排在最后，直接取最后一条会把真正的原因
+    // （配额用尽、鉴权失效…）盖掉，用户看到一句莫名其妙的 invalid YAML。
+    const semantic = [...events].reverse().find(
+      (e) => e.type === 'turn.failed' || (e.type === 'error' && !String(e.message ?? '').startsWith('codex exited')),
+    );
+    if (semantic) {
+      const msg =
+        semantic.type === 'turn.failed'
+          ? (semantic.error as { message?: string } | undefined)?.message
+          : (semantic.message as string | undefined);
+      if (msg) return `[codex] ${msg}`;
     }
+    const exited = [...events].reverse().find((e) => e.type === 'error' && typeof e.message === 'string');
+    if (exited) return `[codex] ${exited.message as string}`;
     return '';
   }
 }
