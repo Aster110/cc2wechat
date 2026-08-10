@@ -23,7 +23,7 @@ function makeFakeCore(events: unknown[] | (() => AsyncIterable<unknown>)) {
     chat,
     closeSession,
     closeAllSessions,
-    loadModule: vi.fn(async () => ({ OfficialAdapter: function () { return adapter; } as unknown as new () => unknown })),
+    loadModule: vi.fn(async () => ({ OfficialAdapter: function () { return adapter; } })) as any,
   };
 }
 
