@@ -51,6 +51,7 @@ export async function getConfig(
     token,
     timeoutMs: DEFAULT_CONFIG_TIMEOUT_MS,
     label: 'getConfig',
+    failOnBodyError: true,
   });
   return JSON.parse(rawText) as GetConfigResp;
 }

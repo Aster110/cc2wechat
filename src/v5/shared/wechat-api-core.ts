@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import type { BaseInfo } from '../../types.js';
+import { assertNoBodyError } from '../../v6/wechat/errcode.js';
 
 export const BASE_URL = 'https://ilinkai.weixin.qq.com';
 export const CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
@@ -40,6 +41,12 @@ export async function apiFetch(params: {
   token?: string;
   timeoutMs: number;
   label: string;
+  /**
+   * 微信永远回 HTTP 200,失败信息藏在 body 的 ret/errcode 里。
+   * 发送类接口开这个,别把"没发出去"当成功。
+   * getUpdates 不能开 —— poller 靠这些错误码做暂停与退避。
+   */
+  failOnBodyError?: boolean;
 }): Promise<string> {
   const base = ensureTrailingSlash(params.baseUrl ?? BASE_URL);
   const url = new URL(params.endpoint, base);
@@ -59,6 +66,7 @@ export async function apiFetch(params: {
     if (!res.ok) {
       throw new Error(`${params.label} ${res.status}: ${rawText}`);
     }
+    if (params.failOnBodyError) assertNoBodyError(params.label, rawText);
     return rawText;
   } catch (err) {
     clearTimeout(timer);
