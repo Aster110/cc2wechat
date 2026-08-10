@@ -8,6 +8,9 @@ import { loginWithQR, loginWithQRWeb } from './auth.js';
 import { saveAccount, getActiveAccount } from './store.js';
 import { sendMessage, uploadAndSendMedia } from './wechat-api.js';
 import { installSkill } from './skill-install.js';
+import { resolveReplyContext } from './v6/reply-context.js';
+import { startEngine } from './v6/engine-select.js';
+import { loadConfig } from './v5/core/config.js';
 
 // ---------------------------------------------------------------------------
 // Aliases: ~/.cc2wechat/aliases.json — maps friendly names to ports
@@ -134,6 +137,8 @@ function printUsage(): void {
 // Reply
 // ---------------------------------------------------------------------------
 
+// v6 起 ctx 只存路由(~/.cc2wechat/ctx/,0700)，token 现查 accounts-<port>.json；
+// /tmp 的老格式在 v5 并存期继续兜底。--end 还要用文件路径，所以单独留一个查找函数。
 function findContextPath(): string {
   if (process.env.CC2WECHAT_CONTEXT && fs.existsSync(process.env.CC2WECHAT_CONTEXT)) {
     return process.env.CC2WECHAT_CONTEXT;
@@ -148,20 +153,13 @@ function findContextPath(): string {
   return '/tmp/cc2wechat-context.json';
 }
 
-const contextPath = findContextPath();
-
 async function reply(): Promise<void> {
-  if (!fs.existsSync(contextPath)) {
+  const ctx = resolveReplyContext();
+  if (!ctx) {
     console.error('No active WeChat context. cc2wechat daemon must be running.');
     process.exit(1);
+    return;
   }
-
-  const ctx = JSON.parse(fs.readFileSync(contextPath, 'utf-8')) as {
-    token: string;
-    baseUrl?: string;
-    userId: string;
-    contextToken: string;
-  };
 
   if (command === '--image' || command === '--file') {
     const filePath = args[1];
@@ -230,7 +228,16 @@ async function login(): Promise<void> {
 
 function startOne(port: number): void {
   process.env.CC2WECHAT_PORT = String(port);
-  import('./v5/main.js');
+  // 引擎路由 = 生产回退开关：tmux/terminal 投递或 CC2WECHAT_ENGINE=v5 继续走 v5，
+  // 其余（sdk/pipe/auto/未设）走 v6 常驻核心。
+  void startEngine({
+    env: process.env,
+    config: loadConfig(),
+    importer: (specifier) => import(specifier),
+  }).catch((err) => {
+    console.error(`Failed to start engine: ${String(err)}`);
+    process.exit(1);
+  });
 }
 
 function stopOne(port: number): boolean {
