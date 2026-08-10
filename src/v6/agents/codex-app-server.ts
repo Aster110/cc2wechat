@@ -670,8 +670,12 @@ export class CodexAppServerAgent implements AgentAdapter {
 
     const interrupt = (): void => {
       if (!turnId) return;
-      // 打断是发消息,不是杀进程 —— 这个 app-server 上还挂着别人的会话
-      conn.notify('turn/interrupt', { threadId, turnId });
+      // 打断是发消息,不是杀进程 —— 这个 app-server 上还挂着别人的会话。
+      //
+      // 发的是**请求**(带 id)而不是通知:协议里 turn/interrupt 属于 ClientRequest,
+      // 发成通知的话服务端完全可以不当回事,那一轮会在后台继续烧 token,而我们这边已经收摊了。
+      // 但不等回包 —— /stop 要的是"立刻",等 ack 只会把收敛时间拖长。
+      void conn.request('turn/interrupt', { threadId, turnId }, THREAD_OP_TIMEOUT_MS);
     };
 
     let aborted = false;
