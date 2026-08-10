@@ -19,6 +19,8 @@ import { startV6HealthServer, packageVersion } from './health.js';
 import { TurnRingBuffer, pollLoop, startIdleSweeper } from './poller.js';
 
 const HEALTH_PORT = parseInt(process.env.CC2WECHAT_PORT ?? '18081', 10);
+/** 停机时最多等在跑的那几轮 10 秒;等不完也得走,systemd 的耐心是有限的 */
+const DRAIN_TIMEOUT_MS = 10_000;
 
 // 下面两个小工具与 v5/main.ts 同源。没有直接 import 是因为 v5/main.ts
 // 在模块顶层就跑 main() —— 引它一下就会顺手把 v5 daemon 也拉起来。
@@ -96,7 +98,7 @@ async function main(): Promise<void> {
   console.log(`  Working directory: ${cwd}`);
   console.log('  Listening for WeChat messages...\n');
 
-  startV6HealthServer(HEALTH_PORT, {
+  const healthServer = startV6HealthServer(HEALTH_PORT, {
     account,
     agent,
     scheduler,
@@ -106,9 +108,38 @@ async function main(): Promise<void> {
   });
   log(`Health server on 127.0.0.1:${HEALTH_PORT}`);
 
+  // ---- 优雅停机 --------------------------------------------------------
+  // 常驻后端(codex app-server / claude SDK 池)是**子进程**。
+  // 进程被 SIGKILL 时它们不会跟着走,留下的孤儿会抓着 thread 写锁,
+  // 下一次启动 resume 同一条 thread 就撞锁。systemd/launchd 重启走的是 SIGTERM,
+  // 只要这里收得住,就永远不会走到"靠 pid 文件收尸"那条兜底路径上。
+  const stopping = new AbortController();
+  let stopped = false;
+  const gracefulStop = async (sig: string): Promise<void> => {
+    if (stopped) return;
+    stopped = true;
+    log(`收到 ${sig}，优雅停机中…`);
+    stopping.abort();
+    healthServer.close();
+    try {
+      await Promise.race([scheduler.drain(), new Promise((r) => setTimeout(r, DRAIN_TIMEOUT_MS))]);
+    } catch (err) {
+      logError(`drain failed: ${String(err)}`);
+    }
+    try {
+      await agent.shutdown();
+    } catch (err) {
+      logError(`agent shutdown failed: ${String(err)}`);
+    }
+    log('停机完成');
+    process.exit(0);
+  };
+  process.on('SIGTERM', () => void gracefulStop('SIGTERM'));
+  process.on('SIGINT', () => void gracefulStop('SIGINT'));
+
   const deps = { account, accountName: accountName ?? undefined, cwd, agent, scheduler, store, orchestrator, turns };
   startIdleSweeper(deps);
-  await pollLoop(deps);
+  await pollLoop({ ...deps, stopSignal: stopping.signal });
 }
 
 main().catch((err) => {

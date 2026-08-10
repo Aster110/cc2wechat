@@ -9,6 +9,7 @@ import { saveAccount, getActiveAccount } from './store.js';
 import { sendMessage, uploadAndSendMedia } from './wechat-api.js';
 import { installSkill } from './skill-install.js';
 import { resolveReplyContext } from './v6/reply-context.js';
+import { endSession } from './v6/end-session.js';
 import { startEngine } from './v6/engine-select.js';
 import { loadConfig } from './v5/core/config.js';
 
@@ -436,26 +437,21 @@ switch (command) {
     break;
 
   case '--end': {
-    // CC 调这个命令关闭自己的 iTerm session
+    // v5：daemon 有 /close-session（关 tmux/iTerm 会话）
+    // v6：没有这个端点。以前那句 .catch(() => {}) 把 404 吞了还打印 "Session closed."，
+    //     等于对 agent 撒谎。现在打不通就去查 ctx，查不到就明说。
     const cp = findContextPath();
-    const port = parseInt(process.env.CC2WECHAT_PORT ?? String(BASE_PORT), 10);
-    fetch(`http://localhost:${port}/close-session`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contextPath: cp }),
-    }).then(() => {
-      console.log('Session closed.');
-    }).catch(() => {
-      // fallback: 尝试所有端口
-      const ports = getAllPorts();
-      Promise.all(ports.map(p =>
-        fetch(`http://localhost:${p}/close-session`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ contextPath: cp }),
-        }).catch(() => {})
-      )).then(() => console.log('Session closed.'));
-    });
+    const primary = parseInt(process.env.CC2WECHAT_PORT ?? String(BASE_PORT), 10);
+    const ports = [primary, ...getAllPorts().filter((p) => p !== primary)];
+    endSession({ ports, contextPath: cp })
+      .then((r) => {
+        console.log(r.message);
+        if (!r.ok) process.exit(1);
+      })
+      .catch((err) => {
+        console.error(String(err));
+        process.exit(1);
+      });
     break;
   }
 

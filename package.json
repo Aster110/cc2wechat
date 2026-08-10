@@ -15,7 +15,8 @@
     "wechat-cc-channel": "dist/server.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "rm -rf dist && tsc",
+    "typecheck": "tsc -p tsconfig.test.json",
     "dev": "tsx src/server.ts",
     "test": "vitest run",
     "prepublishOnly": "npm run build"

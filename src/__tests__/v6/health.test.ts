@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
 
-import { startV6HealthServer, packageVersion } from '../../v6/health.js';
+import { startV6HealthServer, packageVersion, probeAgentHealth } from '../../v6/health.js';
 import { TurnRingBuffer } from '../../v6/poller.js';
 import { InMemoryScheduler } from '../../v6/scheduler.js';
 
@@ -27,7 +27,11 @@ let port: number;
 let scheduler: InMemoryScheduler;
 let turns: TurnRingBuffer;
 
-const agent = { name: 'codex', persistent: false } as any;
+const agent = {
+  name: 'codex',
+  persistent: false,
+  health: async () => ({ ok: true, detail: 'app-server up' }),
+} as any;
 
 beforeEach(async () => {
   scheduler = new InMemoryScheduler({ maxConcurrent: 2, onError: () => {} });
@@ -119,6 +123,40 @@ describe('GET /health', () => {
     const body = JSON.parse((await get(port, '/health')).body);
     expect(body.turns).toHaveLength(1);
     expect(body.turns[0]).toMatchObject({ conversationId: 'conv-1', outcome: 'final', totalMs: 3 });
+  });
+});
+
+describe('agentHealth —— "活着" 不等于 "能用"', () => {
+  it('/health 带上后端自报的健康状态', async () => {
+    const body = JSON.parse((await get(port, '/health')).body);
+    expect(body.agentHealth).toEqual({ ok: true, detail: 'app-server up' });
+  });
+
+  it('后端 1 秒答不上来就当不健康 —— 微信那头一样是在干等', async () => {
+    const hung = { name: 'codex', health: () => new Promise(() => {}) } as any;
+    const r = await probeAgentHealth(hung, 30);
+    expect(r).toEqual({ ok: false, detail: 'timeout' });
+  });
+
+  it('health() 抛异常不该把 /health 一起带崩', async () => {
+    const broken = { name: 'codex', health: async () => { throw new Error('socket closed'); } } as any;
+    const r = await probeAgentHealth(broken, 100);
+    expect(r.ok).toBe(false);
+    expect(r.detail).toContain('socket closed');
+  });
+
+  it('没实现 health() 的 agent 不算故障', async () => {
+    expect(await probeAgentHealth({ name: 'legacy' } as any, 50)).toEqual({
+      ok: true,
+      detail: 'agent 未实现 health()',
+    });
+  });
+
+  it('降级中的后端会如实上报', async () => {
+    const degraded = { name: 'codex', health: async () => ({ ok: false, detail: 'degraded → codex-exec(起不来)' }) } as any;
+    const r = await probeAgentHealth(degraded, 100);
+    expect(r.ok).toBe(false);
+    expect(r.detail).toContain('degraded');
   });
 });
 
