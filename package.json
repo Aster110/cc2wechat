@@ -1,6 +1,6 @@
 {
   "name": "@aster110/cc2wechat",
-  "version": "5.1.2",
+  "version": "5.2.0",
   "description": "WeChat channel for Claude Code — chat with Claude Code from WeChat via iLink Bot API",
   "type": "module",
   "exports": {
