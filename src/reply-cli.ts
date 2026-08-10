@@ -4,38 +4,20 @@
 
 import fs from 'node:fs';
 import { sendMessage, uploadAndSendMedia } from './wechat-api.js';
+import { resolveReplyContext } from './v6/reply-context.js';
 
 const args = process.argv.slice(2);
 
-// 查找 context 文件：优先环境变量 → 扫描 /tmp/cc2wechat-ctx-*.json（取最新）→ legacy 路径
-function findContextPath(): string {
-  if (process.env.CC2WECHAT_CONTEXT && fs.existsSync(process.env.CC2WECHAT_CONTEXT)) {
-    return process.env.CC2WECHAT_CONTEXT;
-  }
-  // 扫描所有 per-user context 文件，取最近修改的
-  try {
-    const files = fs.readdirSync('/tmp')
-      .filter(f => f.startsWith('cc2wechat-ctx-') && f.endsWith('.json'))
-      .map(f => ({ name: f, mtime: fs.statSync(`/tmp/${f}`).mtimeMs }))
-      .sort((a, b) => b.mtime - a.mtime);
-    if (files.length > 0) return `/tmp/${files[0].name}`;
-  } catch { /* ignore */ }
-  return '/tmp/cc2wechat-context.json';
-}
+// v6 起 ctx 只存路由(~/.cc2wechat/ctx/,0700)，token 现查 accounts-<port>.json；
+// /tmp 的老格式在 v5 并存期继续兜底。
+const resolved = resolveReplyContext();
 
-const contextPath = findContextPath();
-
-if (!fs.existsSync(contextPath)) {
+if (!resolved) {
   console.error('No active WeChat context. cc2wechat daemon must be running.');
   process.exit(1);
 }
 
-const ctx = JSON.parse(fs.readFileSync(contextPath, 'utf-8')) as {
-  token: string;
-  baseUrl?: string;
-  userId: string;
-  contextToken: string;
-};
+const ctx = resolved!;
 
 async function main(): Promise<void> {
   if (args[0] === '--image' || args[0] === '--file') {

@@ -40,6 +40,7 @@ export async function sendMessage(
     token,
     timeoutMs: DEFAULT_API_TIMEOUT_MS,
     label: 'sendMessage',
+    failOnBodyError: true,
   });
 }
 
@@ -62,6 +63,7 @@ export async function sendTyping(
     token,
     timeoutMs: DEFAULT_CONFIG_TIMEOUT_MS,
     label: 'sendTyping',
+    failOnBodyError: true,
   });
 }
 
@@ -118,6 +120,7 @@ export async function uploadAndSendMedia(params: {
     token,
     timeoutMs: DEFAULT_API_TIMEOUT_MS,
     label: 'getUploadUrl',
+    failOnBodyError: true,
   });
   const uploadUrlResp = JSON.parse(uploadUrlRaw) as GetUploadUrlResp;
   const uploadParam = uploadUrlResp.upload_param;
@@ -198,6 +201,7 @@ export async function uploadAndSendMedia(params: {
       token,
       timeoutMs: DEFAULT_API_TIMEOUT_MS,
       label: 'sendMediaMessage',
+      failOnBodyError: true,
     });
   } catch (err) {
     clearTimeout(timer);

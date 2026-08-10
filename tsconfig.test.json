@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "declaration": false
+  },
+  // 只覆盖 src（含 src/__tests__）——与本次改动前 tsc 的覆盖面一致。
+  // 顶层 tests/ 历来就没进过类型检查（auth.test.ts 里有存量 vitest MockInstance 报错），
+  // 这次不顺手扩面，免得把"和我这次改动无关的红"混进交付。
+  "include": ["src"],
+  "exclude": ["node_modules", "dist"]
+}
