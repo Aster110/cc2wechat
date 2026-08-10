@@ -138,21 +138,25 @@ Claude Code daemons):
 
 | Variable | Effect |
 |----------|--------|
-| `CC2WECHAT_BACKEND` | `claude-code` (default) or `codex` |
+| `CC2WECHAT_BACKEND` | `claude-code` (default), `codex` (persistent app-server), or `codex-exec` (one-shot spawn escape hatch) |
 | `CC2WECHAT_DELIVERY` | Same values as `delivery` below |
+| `CC2WECHAT_ENGINE` | `v5` / `v6` — force an engine; the ultimate rollback switch |
 | `CC2WECHAT_CODEX_EFFORT` | Overrides codex `model_reasoning_effort` for this channel only |
 | `CC2WECHAT_PORT` | Which account/port this daemon serves |
 | `CODEX_HOME` | Point codex at a separate auth/config dir (multi-account isolation) |
+| `CC2WECHAT_TURN_TIMEOUT_MS` / `CC2WECHAT_SESSION_TTL_MS` / `CC2WECHAT_MAX_CONCURRENT` / `CC2WECHAT_QUEUE_CAP` | v6 tunables: per-turn timeout (600s), idle session TTL (12h), global concurrency (2), per-conversation queue cap (5) |
 
 ### Delivery modes
 
+Since v5.2.0 the headless **v6 engine** is the default. `delivery` now mostly decides which engine you get:
+
 | Value | Behavior |
 |-------|----------|
-| `"auto"` | Auto-detect: iTerm (macOS) > tmux > SDK > Pipe |
-| `"terminal"` | Force macOS iTerm AppleScript |
-| `"tmux"` | Force tmux session management (requires `tmux` installed). Auto-starts ttyd Web Terminal for browser access. |
-| `"sdk"` | Force Claude Agent SDK |
-| `"pipe"` | Force CLI stdin/stdout pipe |
+| `"auto"` / `"sdk"` / `"pipe"` / unset | v6 engine: headless `Channel → Core → Agent`, persistent sessions, `/stop`, preemptive commands |
+| `"tmux"` | v5 legacy engine: tmux session management (requires `tmux`). Auto-starts ttyd Web Terminal for browser access. |
+| `"terminal"` | v5 legacy engine: macOS iTerm AppleScript |
+
+Note the behavior change: `"auto"` used to probe iTerm/tmux first; it now always means headless v6. Web-terminal workflows must opt in with `"tmux"` explicitly.
 
 To force tmux delivery on macOS (useful for headless/SSH):
 
@@ -180,26 +184,32 @@ WeChat App  <--  iLink Bot API (send)       <--  Reply via WeChat API   ttyd Web
 - **Auto markdown strip** — Claude's markdown output is cleaned for WeChat plain text
 - **Auto chunking** — long messages are split at 3900 chars
 
-## Architecture (v5)
+## Architecture (v6)
 
-Delivery x Backend decoupled architecture:
+Single-process `Channel → Core → Agent` pipeline (`src/v6/`):
 
-- **Delivery**: how to send messages to Claude Code
-  - Terminal (macOS iTerm AppleScript injection)
-  - Tmux (Linux/macOS tmux session management)
-  - SDK (Claude Agent SDK, cross-platform)
-  - Pipe (CLI stdin/stdout)
-- **Backend**: which agent to drive
-  - Claude Code (`claude --resume` / Agent SDK)
-  - Codex (`codex exec --json`, thread-id session mapping)
-  - Adding a third is one file implementing `AIBackend` (~150 lines) plus one line in `main.ts`
-- **Router**: zero if/else at runtime, everything resolved at boot
+- **Channel**: the WeChat iLink protocol layer (long-poll, media crypto, send)
+- **Core**: orchestration — per-conversation serial scheduler with global slots and bounded
+  queues, preemptive control commands (`/new` `/stop` `/exit` act immediately, never queued
+  behind a long turn), session store (one atomic JSON table: conversation → provider session,
+  port-independent, auto-migrates v5 thread maps), typing heartbeat, slow-turn ack, per-turn
+  timings exposed at `/health` (loopback only)
+- **Agent**: each agent owns its own execution mode behind one interface —
+  `run(req, signal): AsyncIterable<AgentEvent>` plus `reset`/`health`/`shutdown`:
+  - `codex` — **persistent** `codex app-server` child, multi-session by threadId, disk resume
+    after restarts, `turn/interrupt` for `/stop`, auto-degrades to one-shot exec after repeated
+    daemon failures (measured: follow-up turns ~13.5s → ~3.3s vs spawn-per-message)
+  - `codex-exec` — one-shot `codex exec --json` per turn; replies as soon as the turn completes
+    instead of waiting ~3.8s for process teardown
+  - `claude-code` — Claude Agent SDK session pool (processes stay warm between messages)
 
-`AIBackend` is four methods — `buildLaunchCommand`, `chat`, `buildPipeCommand`, `extractResult` —
-plus an optional `resetSession` for backends that own their own session mapping (codex does;
-Claude Code's is managed by the delivery layer).
+Core only ever sees five standardized `AgentEvent`s — raw codex/Claude protocol shapes never
+leak past the agent file, so provider protocol changes stay one-file fixes.
 
-Message handling is non-blocking: each WeChat user gets a serial queue, but the long-poll loop
+The v5 Delivery×Backend engine is still shipped for the tmux/iTerm web-terminal workflows and as
+a rollback path (`CC2WECHAT_ENGINE=v5`).
+
+Message handling is non-blocking: each conversation gets a serial queue, but the long-poll loop
 never waits on the agent. This matters for slow backends — blocking the poll loop makes the
 platform consider the bot offline. See [docs/codex-backend.md](docs/codex-backend.md) for the
 failure modes this cost us to learn.
