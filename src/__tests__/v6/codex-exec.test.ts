@@ -27,6 +27,8 @@ function fakeChild(opts: { stdout?: string[]; stderr?: string; exitCode?: number
     if (opts.holdOpen) child.stdout.push(null);
     return true;
   });
+  child.unref = vi.fn();
+  vi.spyOn(child.stdout, 'resume');
   return child;
 }
 
@@ -219,6 +221,94 @@ describe('CodexExecAgent — 流式事件', () => {
       if (e.type === 'sessionChanged') expect(seen).not.toContain('final');
     }
     expect(seen.indexOf('sessionChanged')).toBeLessThan(seen.indexOf('final'));
+  });
+});
+
+// 实测：turn.completed 之后 codex 还要 3.3~3.8s 才真的退出（写 rollout、卸 MCP 子服务）。
+// 那三秒的等待原本整个算在用户头上，而答案早就在手里了。
+describe('CodexExecAgent — 拿到答案就交付，不等进程退出', () => {
+  it('看到 turn.completed 立刻 final —— 进程一直不退也不影响', async () => {
+    // exitCode=null 且永远不 emit close：老实现会在这里挂死
+    const child = fakeChild({
+      stdout: [
+        '{"type":"thread.started","thread_id":"th-1"}',
+        '{"type":"item.completed","item":{"type":"agent_message","text":"答案"}}',
+        '{"type":"turn.completed"}',
+      ],
+      exitCode: null,
+    });
+    spawnMock.mockReturnValue(child);
+
+    const events = await collect(new CodexExecAgent().run(req(), new AbortController().signal));
+    expect(events[events.length - 1]).toEqual({ type: 'final', text: '答案' });
+    expect(child.exitCode).toBeNull(); // 交付的时候它还活着
+  });
+
+  it('放生而不是补刀：不 kill、排空 stdout、unref 防僵尸', async () => {
+    const child = fakeChild({
+      stdout: [
+        '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}',
+        '{"type":"turn.completed"}',
+      ],
+      exitCode: null,
+    });
+    spawnMock.mockReturnValue(child);
+
+    await collect(new CodexExecAgent().run(req(), new AbortController().signal));
+    // 补刀会把 rollout 写坏 —— 那是下一轮 resume 的依据
+    expect(child.kill).not.toHaveBeenCalled();
+    // 不排空管道，子进程会卡在 write 上永远收不了尾
+    expect(child.stdout.resume).toHaveBeenCalled();
+    expect(child.unref).toHaveBeenCalled();
+  });
+
+  it('只 final 一次（turn.completed 之后流再断也不补发）', async () => {
+    spawnMock.mockReturnValue(
+      fakeChild({
+        stdout: [
+          '{"type":"item.completed","item":{"type":"agent_message","text":"一次就好"}}',
+          '{"type":"turn.completed"}',
+        ],
+        exitCode: null,
+      }),
+    );
+    const events = await collect(new CodexExecAgent().run(req(), new AbortController().signal));
+    expect(events.filter((e) => e.type === 'final')).toHaveLength(1);
+  });
+
+  it('没有 turn.completed 但流断了：有答案照样立刻交付', async () => {
+    const child = fakeChild({
+      stdout: ['{"type":"item.completed","item":{"type":"agent_message","text":"旧版本也认"}}'],
+      exitCode: null,
+    });
+    spawnMock.mockReturnValue(child);
+    const events = await collect(new CodexExecAgent().run(req(), new AbortController().signal));
+    expect(events[events.length - 1]).toEqual({ type: 'final', text: '旧版本也认' });
+    expect(child.kill).not.toHaveBeenCalled();
+  });
+
+  it('没有答案时才等退出码（错误路径的语义一点没变）', async () => {
+    const child = fakeChild({ stdout: ['{"type":"turn.completed"}'], exitCode: null, stderr: 'boom' });
+    spawnMock.mockReturnValue(child);
+    setTimeout(() => child.emit('close', 3), 5);
+    const events = await collect(new CodexExecAgent().run(req(), new AbortController().signal));
+    const err = events.find((e) => e.type === 'error') as any;
+    expect(err.message).toContain('codex exited 3');
+  });
+
+  it('abort 语义不变：中途打断照样 SIGKILL，不产出 final', async () => {
+    const child = fakeChild({ holdOpen: true });
+    spawnMock.mockReturnValue(child);
+    const ctrl = new AbortController();
+    const events: AgentEvent[] = [];
+    const done = (async () => {
+      for await (const e of new CodexExecAgent().run(req(), ctrl.signal)) events.push(e);
+    })();
+    await new Promise((r) => setTimeout(r, 10));
+    ctrl.abort();
+    await done;
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+    expect(events.find((e) => e.type === 'final')).toBeUndefined();
   });
 });
 
