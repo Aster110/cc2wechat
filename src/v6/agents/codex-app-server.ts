@@ -363,7 +363,7 @@ export class AppServerConnection {
     for (const [, resolve] of this.pending) resolve({ error: { code: -3, message: reason } });
     this.pending.clear();
 
-    // 正在跑的那些轮要立刻知道后端没了,否则它们会等到 turn 超时(默认 10 分钟)
+    // 正在跑的那些轮要立刻知道后端没了；默认无墙钟超时，不能靠看门狗收尾。
     for (const [, handler] of [...this.subs]) handler(LOST, { reason });
     this.subs.clear();
 

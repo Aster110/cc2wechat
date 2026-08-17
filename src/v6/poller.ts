@@ -23,7 +23,9 @@ const DEFAULT_LONG_POLL_MS = 35_000;
 
 const DEDUPE_CAPACITY = 200;
 const IDLE_SWEEP_INTERVAL_MS = 10 * 60_000;
-const DEFAULT_TURN_TIMEOUT_MS = 600_000;
+// 复杂 Agent 任务没有稳定的墙钟上限。默认不机械中止；
+// 仍可用 CC2WECHAT_TURN_TIMEOUT_MS 显式配置运维安全阀，0 = 禁用。
+const DEFAULT_TURN_TIMEOUT_MS = 0;
 const DEFAULT_SESSION_TTL_MS = 43_200_000; // 12h
 
 function sleep(ms: number): Promise<void> {

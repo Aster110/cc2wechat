@@ -144,7 +144,7 @@ Claude Code daemons):
 | `CC2WECHAT_CODEX_EFFORT` | Overrides codex `model_reasoning_effort` for this channel only |
 | `CC2WECHAT_PORT` | Which account/port this daemon serves |
 | `CODEX_HOME` | Point codex at a separate auth/config dir (multi-account isolation) |
-| `CC2WECHAT_TURN_TIMEOUT_MS` / `CC2WECHAT_SESSION_TTL_MS` / `CC2WECHAT_MAX_CONCURRENT` / `CC2WECHAT_QUEUE_CAP` | v6 tunables: per-turn timeout (600s), idle session TTL (12h), global concurrency (2), per-conversation queue cap (5) |
+| `CC2WECHAT_TURN_TIMEOUT_MS` / `CC2WECHAT_SESSION_TTL_MS` / `CC2WECHAT_MAX_CONCURRENT` / `CC2WECHAT_QUEUE_CAP` | v6 tunables: per-turn timeout (disabled by default; `0` disables it), idle session TTL (12h), global concurrency (2), per-conversation queue cap (5) |
 
 ### Delivery modes
 

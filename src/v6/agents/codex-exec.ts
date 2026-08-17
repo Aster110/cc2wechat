@@ -37,7 +37,7 @@ interface CodexLine {
  * 2. 错误提取里语义失败优先于 `codex exited N` 噪音——否则用户看到一句莫名其妙的 invalid YAML,
  *    真正的原因(配额用尽/鉴权失效)被盖掉
  *
- * 与 v5 的差异:不再内置 10 分钟看门狗,超时统一由 orchestrator 的 AbortSignal 管。
+ * 不内置墙钟看门狗，用户 /stop、进程关停或显式运维超时统一由 AbortSignal 管。
  *
  * 2026-08-10 提速:拿到答案就吐,不等进程退出。
  * 实测 `turn.completed` 到进程真的 exit 还有 3.3~3.8 秒(收尾写 rollout、卸 MCP 子服务),

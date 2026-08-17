@@ -16,7 +16,7 @@ vi.mock('../../v5/receiver/media.js', () => ({
   downloadMediaItems: vi.fn().mockResolvedValue(new Map()),
 }));
 
-import { MessageDispatcher, TurnRingBuffer, pollLoop, startIdleSweeper } from '../../v6/poller.js';
+import { MessageDispatcher, TurnRingBuffer, pollLoop, startIdleSweeper, turnTimeoutMs } from '../../v6/poller.js';
 import { InMemoryScheduler } from '../../v6/scheduler.js';
 import { deriveConversationId } from '../../v6/session-store.js';
 import { getUpdates, sendMessage } from '../../wechat-api.js';
@@ -352,6 +352,41 @@ describe('MessageDispatcher — 每轮观测', () => {
 });
 
 describe('MessageDispatcher — 单轮超时', () => {
+  it('默认不设机械墙钟超时，10 分钟后仍由用户 /stop 终止', async () => {
+    delete process.env.CC2WECHAT_TURN_TIMEOUT_MS;
+    expect(turnTimeoutMs()).toBe(0);
+
+    vi.useFakeTimers();
+    try {
+      const { deps, scheduler, orchestrator } = makeDeps();
+      const d = new MessageDispatcher(deps);
+      let aborted = false;
+      orchestrator.runTurn.mockImplementation(
+        (_m: IncomingMessage, signal: AbortSignal) =>
+          new Promise<TurnResult>((resolve) => {
+            signal.addEventListener('abort', () => {
+              aborted = true;
+              resolve({ outcome: 'aborted', firstEventMs: 1 });
+            });
+          }),
+      );
+
+      await d.handle(textMsg('复杂长任务', 'user-1', 9251));
+      await vi.advanceTimersByTimeAsync(10 * 60_000 + 1);
+
+      expect(aborted).toBe(false);
+      expect((sendMessage as any).mock.calls.map((c: any[]) => String(c[2]))).not.toContainEqual(
+        expect.stringContaining('拆小'),
+      );
+
+      await d.handle(textMsg('/stop', 'user-1', 9252));
+      await scheduler.drain();
+      expect(aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('超时 abort 该轮并回超时文案', async () => {
     process.env.CC2WECHAT_TURN_TIMEOUT_MS = '30';
     const { deps, scheduler, orchestrator } = makeDeps();

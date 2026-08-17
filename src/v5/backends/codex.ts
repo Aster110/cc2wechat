@@ -8,7 +8,7 @@ import type { AIBackend, LaunchOpts, ChatOpts, PipeOpts, BackendEvent } from '..
 // codex 没有"指定 id 创建会话"的能力：thread_id 由首次 exec 生成。
 // 这里维护 bridge sessionId(userIdToSessionUUID) → codex thread_id 的映射，按端口分文件，
 // 重置某用户上下文 = 删掉映射文件里对应条目（或整个文件）。
-const CHAT_TIMEOUT_MS = 10 * 60_000;
+const DEFAULT_CHAT_TIMEOUT_MS = 0;
 // aster 的使用习惯：codex 全程 bypass（等价 config.toml 的 approval_policy=never + danger-full-access，
 // 但显式带旗更稳，与 claude-code 后端的 --dangerously-skip-permissions 对称）
 const BYPASS_FLAG = '--dangerously-bypass-approvals-and-sandbox';
@@ -47,6 +47,14 @@ function shellQuote(s: string): string {
 
 function codexEnvPrefix(): string {
   return process.env.CODEX_HOME ? `CODEX_HOME=${shellQuote(process.env.CODEX_HOME)} ` : '';
+}
+
+/** legacy v5 也遵守同一个开关：默认无墙钟超时，0 = 禁用。 */
+export function legacyCodexChatTimeoutMs(): number {
+  const raw = process.env.CC2WECHAT_TURN_TIMEOUT_MS;
+  if (raw == null || raw === '') return DEFAULT_CHAT_TIMEOUT_MS;
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 0 ? value : DEFAULT_CHAT_TIMEOUT_MS;
 }
 
 /**
@@ -92,10 +100,14 @@ export class CodexBackend implements AIBackend {
       stderrTail = (stderrTail + d.toString()).slice(-2000);
     });
     let timedOut = false;
-    const killer = setTimeout(() => {
-      timedOut = true;
-      child.kill('SIGKILL');
-    }, CHAT_TIMEOUT_MS);
+    const timeoutMs = legacyCodexChatTimeoutMs();
+    const killer =
+      timeoutMs > 0
+        ? setTimeout(() => {
+            timedOut = true;
+            child.kill('SIGKILL');
+          }, timeoutMs)
+        : null;
 
     try {
       const rl = readline.createInterface({ input: child.stdout });
@@ -121,13 +133,13 @@ export class CodexBackend implements AIBackend {
         // SIGKILL 后 close code 是 null，不特判就会变成沉默的 "[No response]"
         yield {
           type: 'error',
-          message: `这轮超过 ${Math.round(CHAT_TIMEOUT_MS / 60_000)} 分钟没跑完，已中止。把任务拆小一点再试。`,
+          message: `这轮超过 ${Math.round(timeoutMs / 60_000)} 分钟没跑完，已中止。把任务拆小一点再试。`,
         };
       } else if (code !== 0) {
         yield { type: 'error', message: `codex exited ${code}: ${stderrTail.slice(-300)}` };
       }
     } finally {
-      clearTimeout(killer);
+      if (killer) clearTimeout(killer);
       if (child.exitCode == null) child.kill('SIGKILL');
     }
   }
