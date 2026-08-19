@@ -200,10 +200,19 @@ export function createRuntimeCredentialProvider(
     const origin = nonEmptyString(payload['origin']);
     const expiresAt = normalizeExpiry(payload['expiresAt']);
     const rawCapabilities = payload['capabilities'];
-    const capabilities =
-      Array.isArray(rawCapabilities) && rawCapabilities.every((item) => typeof item === 'string')
-        ? (rawCapabilities as string[])
-        : null;
+    // 真实 bootstrap 写出的 capabilities 是富对象数组 [{id, methods, …}]，
+    // fake/早期 fixture 用 string[]——两种形状都归一成 id 列表。
+    const capabilities = Array.isArray(rawCapabilities)
+      ? rawCapabilities
+          .map((item) =>
+            typeof item === 'string'
+              ? item
+              : item !== null && typeof item === 'object' && typeof (item as { id?: unknown }).id === 'string'
+                ? (item as { id: string }).id
+                : null,
+          )
+          .reduce<string[] | null>((acc, id) => (acc === null || id === null ? null : [...acc, id]), [])
+      : null;
 
     if (!token || !sessionId || !apiBaseUrl || !origin || expiresAt === null || !capabilities) {
       throw credentialError(

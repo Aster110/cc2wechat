@@ -31,6 +31,7 @@ import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 
 import { CodexAppServerAgent } from '../../v6/agents/codex-app-server.js';
+import { ClaudeSdkAgent } from '../../v6/agents/claude-sdk.js';
 import type { AgentAdapter } from '../../v6/contracts.js';
 
 import type { MailboxChunk } from '../contracts/envelope.js';
@@ -502,16 +503,21 @@ export function buildWakuGateway(options: BuildOptions): WakuGateway {
 
   const conversations = createConversationService({ store, now });
 
+  // Agent 后端可切（WAKU_GATEWAY_AGENT_BACKEND=codex|claude-sdk，缺省 codex）。
+  // 节点上没有 codex 二进制/登录态时（如 air2），用 claude-sdk 走本机 Claude Code 登录态。
+  const backend = (process.env['WAKU_GATEWAY_AGENT_BACKEND'] ?? 'codex').trim().toLowerCase();
   const agent =
     options.agent ??
-    new CodexAppServerAgent({
-      env: {
-        ...process.env,
-        ...(config.codexHome === null ? {} : { CODEX_HOME: config.codexHome }),
-        ...(config.codexEffort === null ? {} : { CC2WECHAT_CODEX_EFFORT: config.codexEffort }),
-      },
-      port: config.healthPort,
-    });
+    (backend === 'claude-sdk' || backend === 'claude'
+      ? new ClaudeSdkAgent()
+      : new CodexAppServerAgent({
+          env: {
+            ...process.env,
+            ...(config.codexHome === null ? {} : { CODEX_HOME: config.codexHome }),
+            ...(config.codexEffort === null ? {} : { CC2WECHAT_CODEX_EFFORT: config.codexEffort }),
+          },
+          port: config.healthPort,
+        }));
 
   const runner = createLocalRunnerAdapter({
     runnerId: config.endpoint.runnerProfileId,
