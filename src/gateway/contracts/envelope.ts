@@ -37,6 +37,8 @@ export const MAILBOX_KINDS = [
   'final',
   'error',
   'ack',
+  /** Playable 侧的在线心跳行（agent_status_v1，按 routeId upsert）。 */
+  'status',
 ] as const;
 export type MailboxKind = (typeof MAILBOX_KINDS)[number];
 
