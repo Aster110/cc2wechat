@@ -98,6 +98,18 @@ export function requireInteger(
   return value;
 }
 
+/** 字段缺省时返回 undefined（调用方据此决定要不要把键写进结果）。 */
+export function optionalInteger(
+  record: Record<string, unknown>,
+  key: string,
+  field: string,
+  min: number,
+  max?: number,
+): number | undefined {
+  if (record[key] === undefined) return undefined;
+  return requireInteger(record, key, field, min, max);
+}
+
 export function requireExactNumber(
   record: Record<string, unknown>,
   key: string,

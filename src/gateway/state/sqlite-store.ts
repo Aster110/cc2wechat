@@ -171,10 +171,16 @@ export interface GatewayTransaction {
   markGrantConsumed(id: string, consumedAt: number): void;
 
   insertInboxReceipt(receipt: ReceiptRow): 'inserted' | 'duplicate';
+  /** 收下之后才判出来的结论（授权失败 / 队列满）回写同一行，重放只会撞 duplicate。 */
+  updateReceiptStatus(pairingId: string, messageId: string, status: ReceiptStatus): void;
   commitCursor(collection: string, cursor: CursorRow): void;
 
   insertOutbox(record: NewOutbox): 'inserted' | 'duplicate';
   markOutboxSent(messageId: string, externalDeliveryId: string, sentAt: number): void;
+  /** 玩家自己说收到了：不再重投，也别伪造一个 externalDeliveryId。 */
+  markOutboxAcknowledged(messageId: string, at: number): void;
+  /** 平台永久拒绝：重试多少次都没用，别占着 pending 让每轮 flush 白跑。 */
+  markOutboxFailed(messageId: string, failedAt: number): void;
 
   saveConversation(conversation: ConversationRow): void;
   bumpGeneration(conversationId: string): number;
@@ -182,6 +188,11 @@ export interface GatewayTransaction {
   saveRunnerAssignment(assignment: RunnerAssignmentRow): void;
 
   startTurn(turn: Omit<TurnRow, 'status'>): void;
+  /**
+   * turn 的收尾写口。只从 running 迁出，所以"崩溃恢复已经标了 interrupted"之后
+   * 迟到的收尾不会把它改回 completed。
+   */
+  finishTurn(turnId: string, status: 'completed' | 'interrupted', endedAt: number): void;
   saveChunk(chunk: StoredChunkRow): 'inserted' | 'duplicate' | 'conflict';
 }
 
@@ -191,6 +202,10 @@ export interface GatewayStore {
   getEndpoint(id: string): AgentEndpoint | null;
   getGrant(id: string): GrantRow | null;
   getPairing(id: string): PairingRow | null;
+  /** 入站只知道 routeId（公开面），身份要从这里翻回来。 */
+  getPairingByRoute(routeId: string): PairingRow | null;
+  /** 轮询要一次带上全部活跃路由（平台读额度按请求算，不是按路由算）。 */
+  listActivePairings(): PairingRow[];
   getPairingSecret(id: string): Uint8Array | null;
   getReceipt(pairingId: string, messageId: string): ReceiptRow | null;
   getCursor(collection: string): CursorRow | null;
@@ -680,6 +695,12 @@ export function openGatewayStore(options: OpenGatewayStoreOptions): GatewayStore
       return result.changes > 0 ? 'inserted' : 'duplicate';
     },
 
+    updateReceiptStatus(pairingId: string, messageId: string, status: ReceiptStatus): void {
+      prep(
+        'UPDATE inbox_receipts SET status = ? WHERE pairing_id = ? AND message_id = ?',
+      ).run(status, pairingId, messageId);
+    },
+
     commitCursor(collection: string, cursor: CursorRow): void {
       prep(
         `INSERT INTO mailbox_cursors (collection, last_created_at, last_message_id)
@@ -713,6 +734,19 @@ export function openGatewayStore(options: OpenGatewayStoreOptions): GatewayStore
             SET status = 'sent', external_delivery_id = ?, sent_at = ?, attempts = attempts + 1
           WHERE message_id = ?`,
       ).run(externalDeliveryId, sentAt, messageId);
+    },
+
+    markOutboxAcknowledged(messageId: string, at: number): void {
+      prep("UPDATE outbox_records SET status = 'sent', sent_at = ? WHERE message_id = ?").run(
+        at,
+        messageId,
+      );
+    },
+
+    markOutboxFailed(messageId: string, failedAt: number): void {
+      prep(
+        "UPDATE outbox_records SET status = 'failed', sent_at = ?, attempts = attempts + 1 WHERE message_id = ?",
+      ).run(failedAt, messageId);
     },
 
     saveConversation(conversation: ConversationRow): void {
@@ -776,6 +810,12 @@ export function openGatewayStore(options: OpenGatewayStoreOptions): GatewayStore
       ).run(turn.turnId, turn.conversationId, turn.pairingId, turn.messageId, turn.startedAt);
     },
 
+    finishTurn(turnId: string, status: 'completed' | 'interrupted', endedAt: number): void {
+      prep(
+        "UPDATE turns SET status = ?, ended_at = ? WHERE turn_id = ? AND status = 'running'",
+      ).run(status, endedAt, turnId);
+    },
+
     saveChunk(chunk: StoredChunkRow): 'inserted' | 'duplicate' | 'conflict' {
       // 同一条消息的 chunkCount 必须全局一致 —— 否则伪造者可以用一个新 count 把 assembly 撑大。
       const head = one('SELECT chunk_count FROM chunk_assemblies WHERE message_id = ? LIMIT 1', chunk.messageId);
@@ -825,6 +865,17 @@ export function openGatewayStore(options: OpenGatewayStoreOptions): GatewayStore
     getEndpoint,
     getGrant,
     getPairing,
+
+    getPairingByRoute(routeId: string): PairingRow | null {
+      const row = one('SELECT * FROM pairings WHERE route_id = ?', routeId);
+      return row === null ? null : toPairing(row);
+    },
+
+    listActivePairings(): PairingRow[] {
+      return many("SELECT * FROM pairings WHERE status = 'active' ORDER BY created_at").map(
+        toPairing,
+      );
+    },
 
     getPairingSecret(id: string): Uint8Array | null {
       const row = one('SELECT secret_ciphertext FROM pairings WHERE id = ?', id);

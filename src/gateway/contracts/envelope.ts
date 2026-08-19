@@ -13,6 +13,7 @@
 import {
   asRecord,
   gatewayError,
+  optionalInteger,
   optionalString,
   requireBase64Url,
   requireExactNumber,
@@ -68,10 +69,48 @@ export interface MailboxChunk {
   payload: { ciphertext: string };
 }
 
-export type SecurePayload =
-  | { type: 'turn'; conversationId: string; text: string; clientSeq: number }
-  | { type: 'control'; op: ControlOp; conversationId: string; targetTurnId?: string }
+/**
+ * 客户端能**发进来**的三类消息，也是 `parseSecurePayload` 的值域。
+ *
+ * `generation` 是可选的：M1 冻结的 turn 不含它（缺省按第 1 代处理），
+ * 带上它的客户端才能表达"我开了新一代"。可选而不是必填，是为了让已发布的
+ * Playable 不必同步升级就还能说话。
+ */
+export type InboundSecurePayload =
+  | { type: 'turn'; conversationId: string; text: string; clientSeq: number; generation?: number }
+  | {
+      type: 'control';
+      op: ControlOp;
+      conversationId: string;
+      generation?: number;
+      targetTurnId?: string;
+    }
   | { type: 'ack'; ackMessageId: string; status: AckStatus };
+
+/** 握手期的两类消息：走 bootstrap 密钥，不走长期方向密钥。 */
+export type PairingSecurePayload =
+  | { type: 'pair_request'; clientNonce: string; clientTimeMs: number; deviceLabel?: string }
+  | {
+      type: 'pair_accept';
+      pairingId: string;
+      routeId: string;
+      channelSecret: string;
+      keyVersion: number;
+      endpointId: string;
+      principalId: string;
+      scopes: string[];
+    }
+  | { type: 'pair_reject'; code: string; message?: string };
+
+/** daemon 发出去的四类消息。Core 只封这些，永远不封 turn/control。 */
+export type OutboundSecurePayload =
+  | { type: 'progress'; conversationId: string; replyTo: string; stage: ProgressStage; text?: string }
+  | { type: 'final'; conversationId: string; replyTo: string; text: string }
+  | { type: 'error'; code: string; message?: string; conversationId?: string; replyTo?: string }
+  | { type: 'status'; agent: AgentState; at: number; queued?: number; running?: number };
+
+/** 线上可能出现的全部载荷。入站解析仍只认 `SECURE_PAYLOAD_TYPES` 那三种。 */
+export type SecurePayload = InboundSecurePayload | PairingSecurePayload | OutboundSecurePayload;
 
 export const CONTROL_OPS = ['stop', 'new', 'resume'] as const;
 export type ControlOp = (typeof CONTROL_OPS)[number];
@@ -79,6 +118,13 @@ export type ControlOp = (typeof CONTROL_OPS)[number];
 export const ACK_STATUSES = ['received', 'completed', 'displayed'] as const;
 export type AckStatus = (typeof ACK_STATUSES)[number];
 
+export const PROGRESS_STAGES = ['received', 'queued', 'running'] as const;
+export type ProgressStage = (typeof PROGRESS_STAGES)[number];
+
+export const AGENT_STATES = ['online', 'busy', 'degraded', 'offline'] as const;
+export type AgentState = (typeof AGENT_STATES)[number];
+
+/** 入站白名单。出站/握手类型**故意不在**这里：玩家伪造一条 final 不该被解析成功。 */
 export const SECURE_PAYLOAD_TYPES = ['turn', 'control', 'ack'] as const;
 export type SecurePayloadType = (typeof SECURE_PAYLOAD_TYPES)[number];
 
@@ -97,8 +143,8 @@ const CHUNK_KEYS = [
   'payload',
 ] as const;
 
-const TURN_KEYS = ['type', 'conversationId', 'text', 'clientSeq'] as const;
-const CONTROL_KEYS = ['type', 'op', 'conversationId', 'targetTurnId'] as const;
+const TURN_KEYS = ['type', 'conversationId', 'text', 'clientSeq', 'generation'] as const;
+const CONTROL_KEYS = ['type', 'op', 'conversationId', 'generation', 'targetTurnId'] as const;
 const ACK_KEYS = ['type', 'ackMessageId', 'status'] as const;
 
 /**
@@ -168,14 +214,18 @@ export function parseSecurePayload(input: unknown): SecurePayload {
   const record = asRecord(input, 'payload');
   const type = requireLiteral(record, 'type', 'type', SECURE_PAYLOAD_TYPES);
 
+  // generation 缺省时**不写进结果**：M1 冻结的 turn 是四个键，凭空多一个键会让
+  // 按字段清单断言的用例（两端各一套）全线错位。
   if (type === 'turn') {
     rejectUnknownKeys(record, TURN_KEYS);
-    return {
+    const turn: SecurePayload = {
       type,
       conversationId: requireString(record, 'conversationId', 'conversationId'),
       text: requireText(record, 'text', 'text'),
       clientSeq: requireInteger(record, 'clientSeq', 'clientSeq', 0),
     };
+    const generation = optionalInteger(record, 'generation', 'generation', 1);
+    return generation === undefined ? turn : { ...turn, generation };
   }
 
   if (type === 'control') {
@@ -183,9 +233,13 @@ export function parseSecurePayload(input: unknown): SecurePayload {
     const op = requireLiteral(record, 'op', 'op', CONTROL_OPS);
     const conversationId = requireString(record, 'conversationId', 'conversationId');
     const targetTurnId = optionalString(record, 'targetTurnId', 'targetTurnId');
-    return targetTurnId === undefined
-      ? { type, op, conversationId }
-      : { type, op, conversationId, targetTurnId };
+    const generation = optionalInteger(record, 'generation', 'generation', 1);
+    const control: SecurePayload = { type, op, conversationId };
+    return {
+      ...control,
+      ...(generation === undefined ? {} : { generation }),
+      ...(targetTurnId === undefined ? {} : { targetTurnId }),
+    };
   }
 
   rejectUnknownKeys(record, ACK_KEYS);
