@@ -6,6 +6,9 @@
 //   1. 发一张图给马甲，图里写着一个随机暗号 → 等它用文字把暗号念回来（= 它真的读到了本机文件）
 //   2. 让它把那张图**原样发回来** → 等收到一条 kind=image 的消息（= 上传/发送那半边真的通了）
 //
+// 测试图必须**人眼一秒能读**：第 1 轮判的是"看见没有"，不是"OCR 强不强"。所以渲染走三级降级
+// （真字体优先，自绘点阵只是最后兜底），暗号也只用不易混淆的字符集。
+//
 // 前置：
 //   1. daemon 已起（bridge 模式：WAKU_GATEWAY_CHANNEL=waku-dm + BRIDGE_CREDENTIAL_FILE），/health 绿；
 //   2. owner 的 ~/.config/waku/auth.json 已登录（`waku login`），且 owner 与马甲互相关注。
@@ -14,8 +17,10 @@
 //   WAKU_API_BASE       可选：v1 base，默认 auth.json 的 api_base
 //   WAKU_CLI_AUTH_PATH  可选：默认 ~/.config/waku/auth.json
 //   GOLDEN_TIMEOUT_MS   可选：每轮等回复的上限，默认 300000
+//   GOLDEN_KEEP_IMAGE   可选：=1 时保留生成的 PNG（排查"图到底长啥样"）
 // 纪律：不打印 token；只打印会话 id 前缀与回复前 120 字。
-import { readFileSync, writeFileSync, renameSync, chmodSync, unlinkSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, chmodSync, unlinkSync, existsSync, statSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -75,23 +80,129 @@ async function api(method, route, body) {
   return j;
 }
 
-// ── 画一张写着暗号的 PNG（无依赖：自己拼 5x7 点阵 + zlib deflate） ─────────────
+// ── 测试图：暗号字符集 + 三级渲染降级 ────────────────────────────
+// 字符集刻意剔除所有成对易混字形：0/O/D、1/I/l/J、2/Z、5/S、6/G、8/B、U/V。
+// 剩下的都是"错认了也不像另一个合法字符"的形，第 1 轮失败就一定是没看见，而不是看花了。
+const NONCE_ALPHABET = '3479ACEHKMNPRTWXY';
+const NONCE_LENGTH = 6;
+
+function makeNonce() {
+  let out = '';
+  for (let i = 0; i < NONCE_LENGTH; i += 1) {
+    out += NONCE_ALPHABET[Math.floor(Math.random() * NONCE_ALPHABET.length)];
+  }
+  return out;
+}
+
+/** 回复里只要出现暗号即可：忽略大小写、空格与任何标点/分隔符。 */
+const normalizeReply = (s) => String(s ?? '').toUpperCase().replace(/[^0-9A-Z]/g, '');
+
+/** 从 PNG 的 IHDR 读真实宽高——三种渲染器都产标准 PNG，IHDR 恒在 offset 8。 */
+function pngSize(buf) {
+  if (buf.length < 24 || buf.readUInt32BE(0) !== 0x89504e47 || buf.readUInt32BE(4) !== 0x0d0a1a0a) {
+    throw new Error('rendered file is not a PNG');
+  }
+  if (buf.toString('latin1', 12, 16) !== 'IHDR') throw new Error('PNG has no leading IHDR chunk');
+  const width = buf.readUInt32BE(16);
+  const height = buf.readUInt32BE(20);
+  if (!width || !height) throw new Error(`PNG IHDR has zero dimension ${width}x${height}`);
+  return { width, height };
+}
+
+const FONT_CANDIDATES = [
+  '/System/Library/Fonts/Supplemental/Arial Bold.ttf',
+  '/System/Library/Fonts/Supplemental/Arial.ttf',
+  '/System/Library/Fonts/Helvetica.ttc',
+  '/Library/Fonts/Arial.ttf',
+  '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+  '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+  '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf',
+  '/usr/share/fonts/TTF/DejaVuSans-Bold.ttf',
+];
+const systemFont = () => FONT_CANDIDATES.find((p) => existsSync(p)) || null;
+
+function tryRun(cmd, args) {
+  try {
+    execFileSync(cmd, args, { stdio: ['ignore', 'ignore', 'pipe'], timeout: 30_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 渲染成功 = 文件存在、非空、且能解出合法 IHDR。 */
+function renderedOk(outPath) {
+  try {
+    if (!existsSync(outPath) || statSync(outPath).size === 0) return false;
+    pngSize(readFileSync(outPath));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// 1) ffmpeg drawtext——最好的一档，但很多 brew ffmpeg 没编 libfreetype，drawtext 会缺失，
+//    所以这里只"试"，失败就往下降级，不做任何版本假设。
+function renderWithFfmpeg(text, outPath) {
+  const font = systemFont();
+  // 画布按最宽字形留足余量（drawtext 会把超出画布的部分直接切掉，宁可四周多留白）。
+  const canvasW = text.length * 170 + 260;
+  const draw = ['drawtext=text=' + text, font ? `fontfile=${font}` : null, 'fontsize=180', 'fontcolor=black', 'x=(w-text_w)/2', 'y=(h-text_h)/2']
+    .filter(Boolean)
+    .join(':');
+  const ok = tryRun('ffmpeg', [
+    '-hide_banner', '-loglevel', 'error',
+    '-f', 'lavfi', '-i', `color=c=white:s=${canvasW}x320`,
+    '-vf', draw, '-frames:v', '1', '-y', outPath,
+  ]);
+  return ok && renderedOk(outPath);
+}
+
+// 2) ImageMagick（7 的 `magick` / 6 的 `convert`）——macOS 上默认没配 font，必须显式 -font。
+function renderWithMagick(text, outPath) {
+  const font = systemFont();
+  // 用 label: 让画布跟着文字自动长，再统一加白边——固定 -size 画布会把最后一个字切掉。
+  const args = ['-background', 'white', '-fill', 'black', '-pointsize', '200', '-kerning', '16'];
+  if (font) args.push('-font', font);
+  args.push(`label:${text}`, '-bordercolor', 'white', '-border', '60', outPath);
+  for (const cmd of ['magick', 'convert']) {
+    if (tryRun(cmd, args) && renderedOk(outPath)) return true;
+  }
+  return false;
+}
+
+// 3) 纯 Node 兜底点阵：7x10（不是 5x7）+ scale 18 + 字间距一整格，无依赖但仍然人眼可读。
 import zlib from 'node:zlib';
 
+const GLYPH_W = 7;
+const GLYPH_H = 10;
 const GLYPHS = {
-  0: ['01110', '10001', '10011', '10101', '11001', '10001', '01110'],
-  1: ['00100', '01100', '00100', '00100', '00100', '00100', '01110'],
-  2: ['01110', '10001', '00001', '00010', '00100', '01000', '11111'],
-  3: ['11111', '00010', '00100', '00010', '00001', '10001', '01110'],
-  4: ['00010', '00110', '01010', '10010', '11111', '00010', '00010'],
-  5: ['11111', '10000', '11110', '00001', '00001', '10001', '01110'],
-  6: ['00110', '01000', '10000', '11110', '10001', '10001', '01110'],
-  7: ['11111', '00001', '00010', '00100', '01000', '01000', '01000'],
-  8: ['01110', '10001', '10001', '01110', '10001', '10001', '01110'],
-  9: ['01110', '10001', '10001', '01111', '00001', '00010', '01100'],
-  Z: ['11111', '00001', '00010', '00100', '01000', '10000', '11111'],
-  X: ['10001', '10001', '01010', '00100', '01010', '10001', '10001'],
+  3: ['0111100', '1100110', '0000110', '0001100', '0011100', '0000110', '0000011', '1000011', '1100110', '0111100'],
+  4: ['0000110', '0001110', '0011110', '0110110', '1100110', '1111111', '1111111', '0000110', '0000110', '0000110'],
+  7: ['1111111', '1111111', '0000110', '0001100', '0011000', '0110000', '0110000', '0110000', '0110000', '0110000'],
+  9: ['0111110', '1100011', '1100011', '1100011', '0111111', '0000011', '0000110', '0001100', '0011000', '0110000'],
+  A: ['0011100', '0111110', '1100011', '1100011', '1100011', '1111111', '1111111', '1100011', '1100011', '1100011'],
+  C: ['0111110', '1100011', '1100000', '1100000', '1100000', '1100000', '1100000', '1100000', '1100011', '0111110'],
+  E: ['1111111', '1111111', '1100000', '1100000', '1111100', '1111100', '1100000', '1100000', '1111111', '1111111'],
+  H: ['1100011', '1100011', '1100011', '1100011', '1111111', '1111111', '1100011', '1100011', '1100011', '1100011'],
+  K: ['1100011', '1100110', '1101100', '1111000', '1110000', '1110000', '1111000', '1101100', '1100110', '1100011'],
+  M: ['1100011', '1110111', '1111111', '1101011', '1100011', '1100011', '1100011', '1100011', '1100011', '1100011'],
+  N: ['1100011', '1110011', '1111011', '1111011', '1101111', '1101111', '1100111', '1100011', '1100011', '1100011'],
+  P: ['1111110', '1100011', '1100011', '1100011', '1111110', '1100000', '1100000', '1100000', '1100000', '1100000'],
+  R: ['1111110', '1100011', '1100011', '1100011', '1111110', '1111000', '1101100', '1100110', '1100011', '1100011'],
+  T: ['1111111', '1111111', '0011100', '0011100', '0011100', '0011100', '0011100', '0011100', '0011100', '0011100'],
+  W: ['1100011', '1100011', '1100011', '1100011', '1100011', '1101011', '1101011', '1111111', '1110111', '1100011'],
+  X: ['1100011', '1100011', '0110110', '0011100', '0011100', '0011100', '0011100', '0110110', '1100011', '1100011'],
+  Y: ['1100011', '1100011', '0110110', '0011100', '0011100', '0011100', '0011100', '0011100', '0011100', '0011100'],
 };
+
+// 兜底字体必须覆盖整个暗号字符集，否则会静默画出空白格子——那是"看不见"里最难查的一种。
+for (const ch of NONCE_ALPHABET) {
+  const glyph = GLYPHS[ch];
+  if (!glyph || glyph.length !== GLYPH_H || glyph.some((row) => row.length !== GLYPH_W)) {
+    throw new Error(`bitmap fallback font is missing or malformed for nonce char '${ch}'`);
+  }
+}
 
 function crc32(buf) {
   let c;
@@ -116,10 +227,11 @@ function chunk(type, data) {
 }
 
 /** 大号黑字白底 PNG：Codex 必须能一眼读出这串暗号。 */
-function nonceImage(text, scale = 12) {
+function bitmapNonceImage(text, scale = 18) {
+  const advance = GLYPH_W + 1; // 字间留一整格，避免相邻笔画黏成一团
   const pad = scale * 2;
-  const width = pad * 2 + text.length * 6 * scale;
-  const height = pad * 2 + 7 * scale;
+  const width = pad * 2 + (text.length * advance - 1) * scale;
+  const height = pad * 2 + GLYPH_H * scale;
   const raw = Buffer.alloc(height * (1 + width * 3), 0xff);
   for (let y = 0; y < height; y += 1) raw[y * (1 + width * 3)] = 0; // filter=None
 
@@ -134,12 +246,12 @@ function nonceImage(text, scale = 12) {
   text.split('').forEach((ch, index) => {
     const glyph = GLYPHS[ch];
     if (!glyph) return;
-    for (let row = 0; row < 7; row += 1) {
-      for (let col = 0; col < 5; col += 1) {
+    for (let row = 0; row < GLYPH_H; row += 1) {
+      for (let col = 0; col < GLYPH_W; col += 1) {
         if (glyph[row][col] !== '1') continue;
         for (let dy = 0; dy < scale; dy += 1) {
           for (let dx = 0; dx < scale; dx += 1) {
-            plot(pad + index * 6 * scale + col * scale + dx, pad + row * scale + dy);
+            plot(pad + index * advance * scale + col * scale + dx, pad + row * scale + dy);
           }
         }
       }
@@ -157,6 +269,17 @@ function nonceImage(text, scale = 12) {
     chunk('IDAT', zlib.deflateSync(raw)),
     chunk('IEND', Buffer.alloc(0)),
   ]);
+}
+
+/** 三级降级渲染，返回真实宽高（一律从落盘 PNG 的 IHDR 读，不猜）。 */
+function renderNonceImage(text, outPath) {
+  let renderer = 'bitmap';
+  if (renderWithFfmpeg(text, outPath)) renderer = 'ffmpeg-drawtext';
+  else if (renderWithMagick(text, outPath)) renderer = 'imagemagick';
+  else writeFileSync(outPath, bitmapNonceImage(text));
+  const buf = readFileSync(outPath);
+  const { width, height } = pngSize(buf);
+  return { renderer, width, height, bytes: buf.length };
 }
 
 async function uploadAsset(filePath, mime) {
@@ -214,18 +337,20 @@ async function waitForReply(afterSeq, predicate, label) {
 }
 
 // ── 2. 发一张写着暗号的图，等它把暗号念回来 ─────────────────
-const nonce = `ZX${Math.floor(Math.random() * 900000 + 100000)}`;
+const nonce = makeNonce();
 const imagePath = path.join(os.tmpdir(), `waku-golden-${nonce}.png`);
-const png = nonceImage(nonce);
-writeFileSync(imagePath, png);
-log(`2. turn #1 image nonce=${nonce} bytes=${png.length} …`);
+const rendered = renderNonceImage(nonce, imagePath);
+log(`2. turn #1 image nonce=${nonce} renderer=${rendered.renderer} ${rendered.width}x${rendered.height} bytes=${rendered.bytes} …`);
+if (rendered.renderer === 'bitmap') {
+  log('   (no ffmpeg/drawtext and no ImageMagick on this box — fell back to the built-in bitmap font)');
+}
 
 const assetId = await uploadAsset(imagePath, 'image/png');
-const seq1 = await sendImage(assetId, 0, 0);
+const seq1 = await sendImage(assetId, rendered.width, rendered.height);
 await sendText('这张图片里写着一串暗号，请只回答那串暗号本身，不要任何其他文字。');
 const reply1 = await waitForReply(
   seq1,
-  (m) => m.kind === 'text' && typeof m.body === 'string' && m.body.includes(nonce),
+  (m) => m.kind === 'text' && normalizeReply(m.body).includes(nonce),
   'the persona to read the nonce out of the image',
 );
 log(`   REPLY#1 (conv_seq=${reply1.conv_seq}):`, JSON.stringify(reply1.body).slice(0, 120));
@@ -236,7 +361,8 @@ const seq2 = await sendText('请把我刚才发给你的那张图原样发回给
 const reply2 = await waitForReply(seq2, (m) => m.kind === 'image', 'the persona to send an image back');
 log(`   REPLY#2 (conv_seq=${reply2.conv_seq}, kind=${reply2.kind}, asset=${String(reply2.image?.asset_id ?? '-').slice(0, 16)}…)`);
 
-unlinkSync(imagePath);
+if (process.env.GOLDEN_KEEP_IMAGE === '1') log(`   (kept test image at ${imagePath})`);
+else unlinkSync(imagePath);
 log('');
 log('✅ GOLDEN PATH PASS: image in → Codex reads it → image out');
 log(`   conversation=${conversationId}`);
