@@ -44,6 +44,17 @@ export interface ReceiptRow {
   receivedAt: number;
 }
 
+/**
+ * 出站附件的上传结果缓存值。
+ *
+ * `publicUrl` 是 v4 加的：文件类附件以「一条公开链接」的形式发出去，而 assetId 推不出 URL。
+ * v4 之前写进去的行读出来是 `null`（不是错误）——调用方据此决定「能不能直接复用」。
+ */
+export interface CachedAssetUpload {
+  assetId: string;
+  publicUrl: string | null;
+}
+
 export interface OutboxRow {
   messageId: string;
   pairingId: string;
@@ -180,7 +191,7 @@ export interface GatewayTransaction {
   updateReceiptStatus(pairingId: string, messageId: string, status: ReceiptStatus): void;
   commitCursor(collection: string, cursor: CursorRow): void;
 
-  saveAssetUpload(cacheKey: string, assetId: string, createdAt: number): void;
+  saveAssetUpload(cacheKey: string, upload: CachedAssetUpload, createdAt: number): void;
   insertOutbox(record: NewOutbox): 'inserted' | 'duplicate';
   markOutboxSent(messageId: string, externalDeliveryId: string, sentAt: number): void;
   /** 玩家自己说收到了：不再重投，也别伪造一个 externalDeliveryId。 */
@@ -216,7 +227,7 @@ export interface GatewayStore {
   getReceipt(pairingId: string, messageId: string): ReceiptRow | null;
   getCursor(collection: string): CursorRow | null;
   /** 上传缓存：`maxAgeMs` 之外的行当作不存在（不删，下次覆盖）。 */
-  getAssetUpload(cacheKey: string, now: number, maxAgeMs: number): string | null;
+  getAssetUpload(cacheKey: string, now: number, maxAgeMs: number): CachedAssetUpload | null;
   getOutbox(messageId: string): OutboxRow | null;
   listPendingOutbox(): OutboxRow[];
   getConversation(id: string): ConversationRow | null;
@@ -404,6 +415,18 @@ export const MIGRATIONS: ReadonlyArray<{ version: number; sql: string }> = [
         asset_id TEXT NOT NULL,
         created_at INTEGER NOT NULL
       );
+    `,
+  },
+  {
+    version: 4,
+    sql: `
+      -- 文件类附件（pdf / zip / txt / md / csv / json）以「一条 kind=text 的公开链接」发出去，
+      -- 因为 Waku 私聊没有 file kind。于是正文里要的是 public_url，而 asset_id 推不出 URL。
+      -- 不缓存它的话，「上传成功、发消息失败」的那次重投会把一个 200 MiB 的 zip 再传一遍——
+      -- 那正是这张表存在的理由。
+      --
+      -- 只能是新版本，不能改 v3：v3 已经在别人的库里跑过了（见上一条 migration 的注释）。
+      ALTER TABLE asset_uploads ADD COLUMN public_url TEXT;
     `,
   },
 ];
@@ -748,14 +771,15 @@ export function openGatewayStore(options: OpenGatewayStoreOptions): GatewayStore
       ).run(collection, cursor.lastCreatedAt, cursor.lastMessageId);
     },
 
-    saveAssetUpload(cacheKey: string, assetId: string, createdAt: number): void {
+    saveAssetUpload(cacheKey: string, upload: CachedAssetUpload, createdAt: number): void {
       prep(
-        `INSERT INTO asset_uploads (cache_key, asset_id, created_at)
-         VALUES (?, ?, ?)
+        `INSERT INTO asset_uploads (cache_key, asset_id, public_url, created_at)
+         VALUES (?, ?, ?, ?)
          ON CONFLICT(cache_key) DO UPDATE SET
            asset_id = excluded.asset_id,
+           public_url = excluded.public_url,
            created_at = excluded.created_at`,
-      ).run(cacheKey, assetId, createdAt);
+      ).run(cacheKey, upload.assetId, upload.publicUrl, createdAt);
     },
 
     insertOutbox(record: NewOutbox): 'inserted' | 'duplicate' {
@@ -954,11 +978,13 @@ export function openGatewayStore(options: OpenGatewayStoreOptions): GatewayStore
       };
     },
 
-    getAssetUpload(cacheKey: string, now: number, maxAgeMs: number): string | null {
+    getAssetUpload(cacheKey: string, now: number, maxAgeMs: number): CachedAssetUpload | null {
       const row = one('SELECT * FROM asset_uploads WHERE cache_key = ?', cacheKey);
       if (row === null) return null;
       if (now - num(row, 'created_at') > maxAgeMs) return null;
-      return text(row, 'asset_id');
+      const url = row['public_url'];
+      // v4 之前写进去的行没有这一列的值：assetId 照旧可用，URL 只能重新拿。
+      return { assetId: text(row, 'asset_id'), publicUrl: typeof url === 'string' && url.length > 0 ? url : null };
     },
 
     getOutbox(messageId: string): OutboxRow | null {

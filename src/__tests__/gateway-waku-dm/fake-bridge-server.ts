@@ -100,6 +100,32 @@ export function pythonTimestamp(epochMs: number): string {
   return `${iso.slice(0, 10)} ${iso.slice(11, 23)}000+00:00`;
 }
 
+/**
+ * 平台上传门收的 mime（backend `AGENT_BRIDGE_ASSET_MIME_ALLOWLIST` 默认值的镜像）。
+ *
+ * 媒体类 ∪ 文档类。`text/html` / `image/svg+xml` / `application/javascript` /
+ * `application/octet-stream` **不在里面**——公开桶不裸托管会被浏览器执行的东西。
+ */
+export const UPLOAD_MIME_ALLOWLIST: ReadonlySet<string> = new Set([
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/gif',
+  'video/mp4',
+  'video/quicktime',
+  'audio/mpeg',
+  'audio/mp4',
+  'audio/x-m4a',
+  'audio/wav',
+  'audio/ogg',
+  'application/pdf',
+  'application/zip',
+  'text/plain',
+  'text/markdown',
+  'text/csv',
+  'application/json',
+]);
+
 export class FakeBridgeServer {
   readonly personaUserId: string;
   readonly ownerUserId: string;
@@ -441,6 +467,13 @@ export class FakeBridgeServer {
     const tail = text.lastIndexOf(`--${boundary}--`);
     const bodyStart = headerEnd === -1 ? 0 : headerEnd + 4;
     const bytes = Math.max(0, (tail === -1 ? text.length : tail) - bodyStart - 2);
+
+    // 平台上传门的闸① 在这里也要在：daemon 侧「哪些文件能发」的判断如果与平台漂移，
+    // 只有这道镜像闸会红。白名单与 backend `AGENT_BRIDGE_ASSET_MIME_ALLOWLIST` 的默认值同源。
+    if (!UPLOAD_MIME_ALLOWLIST.has(mime.split(';')[0].trim().toLowerCase())) {
+      this.detail(response, 415, 'agent_bridge_asset_mime_rejected', 'media type not accepted on this door');
+      return;
+    }
 
     this.assetCounter += 1;
     const assetId = `ast_${String(this.assetCounter).padStart(6, '0')}`;

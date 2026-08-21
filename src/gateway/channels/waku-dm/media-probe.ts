@@ -12,13 +12,15 @@
  *   视频原样发（少个封面），语音**不发**（缺 duration_ms 会被平台 422 拒，与其发一条必失败的
  *   请求，不如回一句人话）。降级路径要在日志里响一声，不许静默。
  *
- * 不做的事：不转码（除非显式开 `WAKU_DM_VIDEO_TRANSCODE=1`）、不压缩、不改画质。
- * 用户要发的是他手里那个文件，我们不替他做画质决定。
+ * **转码归 `video-plan.ts` 决策，本模块只执行**：给什么路径就 probe 什么、让转就转、
+ * 让在第几秒抽帧就在第几秒抽。这样「要不要转」是一段能被纯函数单测钉死的判断，
+ * 「怎么转」只是一串 ffmpeg 参数，两件事不缠在一起。
  */
 import { execFile, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { documentMimeForPath } from './file-kinds.js';
 import type { GatewayLogger } from '../../log.js';
 
 export interface ImageDimensions {
@@ -30,6 +32,11 @@ export interface AvProbe {
   width: number | null;
   height: number | null;
   durationMs: number | null;
+  /** 第一条视频流的 `codec_name`（`h264` / `hevc` / `vp9` …）；没有视频流或探不出来 → null。 */
+  videoCodec: string | null;
+  /** 第一条音频流的 `codec_name`（`aac` / `opus` …）；**无音轨也是 null**，用 `hasAudio` 区分。 */
+  audioCodec: string | null;
+  hasAudio: boolean;
 }
 
 export interface MediaProbe {
@@ -39,9 +46,9 @@ export interface MediaProbe {
   hasFfmpeg(): boolean;
   /** ffprobe 一次拿宽高与时长；没有 ffprobe 或探测失败返回 null。 */
   probeAv(filePath: string): Promise<AvProbe | null>;
-  /** 抽第一帧当封面，成功返回文件路径。 */
-  extractPoster(filePath: string, outPath: string): Promise<string | null>;
-  /** 转码到 720p H.264（可选路径，默认关）。 */
+  /** 抽一帧当封面（`atSeconds` 缺省 0 = 首帧），成功返回文件路径。 */
+  extractPoster(filePath: string, outPath: string, atSeconds?: number): Promise<string | null>;
+  /** 转码到 ≤720p H.264 + AAC + faststart，并截断到 `maxSeconds`。 */
   transcode(filePath: string, outPath: string, maxSeconds: number): Promise<string | null>;
 }
 
@@ -148,12 +155,16 @@ const MIME_BY_EXT: Record<string, string> = {
   '.wav': 'audio/wav',
   '.amr': 'audio/amr',
   '.flac': 'audio/flac',
-  '.pdf': 'application/pdf',
 };
 
+/**
+ * 上传时声明的 Content-Type。媒体扩展名走上表，文档扩展名走 `file-kinds` 的白名单镜像
+ * （两处各存一份必然漂移；文档那份是平台上传门白名单的镜像，天然该住在那里）。
+ * 都不认识 → `application/octet-stream`，平台会 415，发送方降级成一句人话。
+ */
 export function mimeForPath(filePath: string): string {
   const ext = path.extname(filePath).toLowerCase();
-  return MIME_BY_EXT[ext] ?? 'application/octet-stream';
+  return MIME_BY_EXT[ext] ?? documentMimeForPath(filePath) ?? 'application/octet-stream';
 }
 
 // ---------------------------------------------------------------------------
@@ -230,13 +241,23 @@ export function createMediaProbe(options: MediaProbeOptions): MediaProbe {
 
       let width: number | null = null;
       let height: number | null = null;
+      let videoCodec: string | null = null;
+      let audioCodec: string | null = null;
+      let hasAudio = false;
       for (const stream of record.streams ?? []) {
+        const codec = typeof stream['codec_name'] === 'string' ? stream['codec_name'].toLowerCase() : null;
+        if (stream['codec_type'] === 'audio') {
+          hasAudio = true;
+          if (audioCodec === null) audioCodec = codec;
+          continue;
+        }
         if (stream['codec_type'] !== 'video') continue;
+        if (videoCodec !== null) continue; // 只认第一条视频流（封面 / 缩略图流不算）
         const w = Number(stream['width']);
         const h = Number(stream['height']);
         if (Number.isFinite(w) && w > 0) width = Math.round(w);
         if (Number.isFinite(h) && h > 0) height = Math.round(h);
-        break;
+        videoCodec = codec;
       }
       if (durationMs === null) {
         for (const stream of record.streams ?? []) {
@@ -247,18 +268,25 @@ export function createMediaProbe(options: MediaProbeOptions): MediaProbe {
           }
         }
       }
-      return { width, height, durationMs };
+      return { width, height, durationMs, videoCodec, audioCodec, hasAudio };
     },
 
-    async extractPoster(filePath: string, outPath: string): Promise<string | null> {
+    async extractPoster(filePath: string, outPath: string, atSeconds = 0): Promise<string | null> {
       if (!hasFfmpeg()) return null;
-      const result = await run(
-        ffmpeg,
-        ['-y', '-loglevel', 'error', '-ss', '0', '-i', filePath, '-frames:v', '1', '-f', 'image2', outPath],
-        timeoutMs,
-      );
-      if (!result.ok || !fs.existsSync(outPath)) return null;
-      return outPath;
+      const seek = String(Math.max(0, atSeconds));
+      // `-ss` 放在 `-i` 之前 = 关键帧粗定位，比解码到那一秒快一个数量级；封面不需要帧级精确。
+      const attempt = async (at: string): Promise<boolean> => {
+        const result = await run(
+          ffmpeg,
+          ['-y', '-loglevel', 'error', '-ss', at, '-i', filePath, '-frames:v', '1', '-f', 'image2', outPath],
+          timeoutMs,
+        );
+        return result.ok && fs.existsSync(outPath) && fs.statSync(outPath).size > 0;
+      };
+      if (await attempt(seek)) return outPath;
+      // 定位越过结尾 ⇒ 一帧都抽不出来。退回首帧总比没有封面强。
+      if (seek !== '0' && (await attempt('0'))) return outPath;
+      return null;
     },
 
     async transcode(filePath: string, outPath: string, maxSeconds: number): Promise<string | null> {
@@ -274,15 +302,24 @@ export function createMediaProbe(options: MediaProbeOptions): MediaProbe {
           '-t',
           String(maxSeconds),
           '-vf',
-          "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease",
+          // 两段 scale 是必须的：第一段限死 ≤1280x720 并保比例，第二段把结果抹成偶数——
+          // libx264 + yuv420p 不接受奇数边长，只写第一段时一个 1079 高的源会当场转码失败。
+          "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2",
           '-c:v',
           'libx264',
           '-preset',
           'veryfast',
           '-crf',
           '26',
+          // 有些源是 yuv444p / 10bit（录屏、AI 生成）：不显式降到 yuv420p 的话，
+          // 转出来的 mp4 在 iOS 上是一片黑——「转过码」不等于「能播」。
+          '-pix_fmt',
+          'yuv420p',
           '-c:a',
           'aac',
+          '-b:a',
+          '128k',
+          // moov 前置：客户端不必先下完整个文件才能起播。
           '-movflags',
           '+faststart',
           outPath,

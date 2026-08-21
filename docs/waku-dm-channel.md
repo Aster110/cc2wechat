@@ -103,6 +103,13 @@ codex app-server 的 `buildTurnInput` 据此发出 `localImage` / `localAudio` �
 
 **下载失败不丢整条消息**：退化成无路径标记（`[Image]`），用户说的话照样进 Agent。
 
+**视频额外抽一帧**（本机有 ffmpeg 时）：落在视频**同目录**的 `<message_id>-<idx>.frame.jpg`，正文追加
+`[VideoFrame: <path>]`，路径也进 `mediaPaths`。为什么需要它：codex app-server 的 turn input 只有
+`localImage` / `localAudio` 两种媒体块，一个 `.mp4` 只会退化成正文里的一行 `[附件] <path>`——
+模型看不看得见画面取决于它想不想自己去 shell 里跑 ffmpeg，而它经常不想。抽好的那一帧作为图片块交上去，
+画面就**必然**进模型的眼睛。取第 1 秒而不是首帧（首帧常是黑场；越过结尾时自动退回首帧）。
+没有 ffmpeg 或抽帧失败就跳过——少一帧不该拖垮整条消息。帧和视频同目录 ⇒ TTL 清理顺手就收了。
+
 ### 出站：标记词法（Core 级，通道无关）
 
 Agent 只会说话，所以最终文本里的标记就是它唯一的出口。解析在 `core/attachments.ts`，
@@ -111,10 +118,50 @@ Agent 只会说话，所以最终文本里的标记就是它唯一的出口。�
 | 标记 | 平台 kind | 说明 |
 |---|---|---|
 | `[[send-image: /abs/path]]` | `image` | 宽高由本机读文件头（PNG/JPEG/GIF/WEBP），读不出就不带 |
-| `[[send-video: /abs/path]]` | `video` | 有 ffmpeg 时抽第一帧当封面（自己也是一次 asset 上传）+ ffprobe 取宽高/时长；没有就原样发并日志告警 |
+| `[[send-video: /abs/path]]` | `video` | **默认先转成可播规格**（见下）+ 抽封面（第 1 秒，自己也是一次 asset 上传）+ ffprobe 取宽高/时长；没有 ffmpeg 就原样发并日志告警 |
 | `[[send-audio: /abs/path]]` | `voice` | **需要 duration_ms**；ffprobe 取不到就**不发**，改回一句人话（发出去必然 422） |
 | `[[send-card: cnt_x]]` / `[[send-card: cnt_x launch_ctx={"room":"AB"}]]` | `playable_card` | 内容必须 `live` 且 `visibility ∈ {public, friends}` |
-| `[[send-file: /abs/path]]` | —（Waku 没有 file kind） | 不发，回一句"文件留在本机 `<path>`" |
+| `[[send-file: /abs/path]]` | `text`（一条公开链接） | Waku 没有 file kind ⇒ 传上传门拿 `public_url`，发 `📎 <名字>（<大小>）\n<url>`；类型不在白名单就不传，回一句人话（见下） |
+
+#### 出站视频：默认转成"手机能播的那种 mp4"
+
+客户端能稳定播的是 **≤60s / ≤720p / H.264 + AAC / faststart 的 mp4**，而**平台后端不转码**。
+Agent 产出的视频五花八门（录屏的 hevc、4K、webm、裸流），默认原样发的结果是用户点开一个转圈圈——
+**而那在用户那端没有任何补救办法**。所以 `WAKU_DM_VIDEO_TRANSCODE` 默认**开**（`=0` 才关）。
+
+但也不无脑转：先 `ffprobe` 判一次源是否已经合规（容器 / 视频 codec / 音频 codec / 宽高 / 时长，纯函数
+`video-plan.ts::planVideoSend`），合规就跳过——再转一遍只会掉画质、烧 CPU、还让上传缓存失效。
+
+| 判据 | 不满足时 |
+|---|---|
+| 扩展名 `.mp4` / `.m4v` | 转（`.mov` / `.webm` / `.mkv` 三端没有一致的可播保证） |
+| 视频 codec `h264` | 转 |
+| 音频 codec `aac` 或**无音轨** | 转 |
+| 宽 ≤1280 且 高 ≤720 | 转 |
+| 时长 ≤`MAX_VIDEO_SECONDS`（60） | 转，并**截断**——正文里追加一句 `⏱ 原视频 1:30，超过 60s 上限，这里只发了前 60s。`（不说的话用户以为视频丢了一半） |
+| ffprobe 探不出来 | 转（「判不了」和「合规」不是一回事） |
+
+转码参数：`libx264 -preset veryfast -crf 26 -pix_fmt yuv420p -c:a aac -b:a 128k -movflags +faststart`，
+scale 两段（先限 ≤1280x720 保比例，再抹成偶数边长——libx264 + yuv420p 不接受奇数边）。
+转码失败 ⇒ **原样发** + 日志响一声（发不出去比画质差更糟）。产物落 `<state>/media/out/`，随 MediaStore 的 TTL 一起清。
+
+#### 出站文件：一条公开链接
+
+Waku 私聊的 `SUPPORTED_MESSAGE_KINDS` 没有 `file`，**也不为此新增**（新增 kind 要动 iOS / Android / Web
+三端渲染 + 通知摘要 + 会话预览，代价远大于一条链接）。所以文件走：
+**上传到 bridge 上传门 → 拿 `public_url` → 发一条 `kind=text`**：`📎 <文件名>（<大小>）\n<url>`（caption 顶在最前面）。
+
+能发哪些：`.pdf` `.zip` `.txt` `.log` `.tsv` `.md` `.markdown` `.csv` `.json` `.jsonl` `.ndjson`
+（= 平台 `AGENT_BRIDGE_ASSET_MIME_ALLOWLIST` 文档半边的本机镜像，`file-kinds.ts`）。
+**判据只有一条：这串字节从公开桶直连时会不会被浏览器执行 / 渲染。** 会的一律不收——`.html` / `.svg` / `.js`
+不在表里（HTML 产物有自己的正路：`waku ship` 成 playable 进受控 runtime）。
+
+- 本机先判一次（扩展名 → mime，再对一次头部字节：pdf `%PDF-` / zip `PK\x03\x04` / 文本类 UTF-8 且无 NUL）。
+  为什么不直接传上去让平台拒：平台的 415 是 `permanent-failure`，用户屏幕上什么都不会出现，
+  而且每一发都要烧一次每日配额和整个文件的上行带宽。
+- 判错了两个方向都收敛在安全侧：表比平台**窄** ⇒ 用户拿到「文件留在本机」，信息没丢；
+  表比平台**宽** ⇒ 上传吃一个 415，被降级成同一句人话（**不是** `permanent-failure`）。
+- 那句人话逐字节是契约：`这个类型的文件发不了（只能发 pdf / zip / txt / md / csv / json），先留在本机：<path>`。
 
 出站单文件上限 200 MiB（`WAKU_GATEWAY_MAX_UPLOAD_BYTES`）：multipart 上传要把整个文件读进内存，
 没有这道闸的话 Agent 一句 `[[send-video: /path/to/4GB.mov]]` 就能把 daemon 撑爆——超限当场回一句人话，不上传。
@@ -129,6 +176,15 @@ Agent 只会说话，所以最终文本里的标记就是它唯一的出口。�
 
 **重投不重复上传**：上传成功、发送失败是最常见的一种失败（没有缓存的话一个 80 MB 的视频会被重传一遍）。
 上传结果落 SQLite `asset_uploads` 表，key = `绝对路径:大小:mtime`，TTL 24h。
+
+- **key 永远按「源文件」算，派生产物只加一个 variant 后缀**（`…#v720@60s` / `…#poster`）。
+  按派生产物自己的 stat 算的话，转码 / 抽帧每跑一次都写出新 mtime ⇒ 重投必然缓存未命中、
+  把刚转好的视频再传一遍——那恰恰是这张表存在的唯一理由。
+- 派生产物的**文件名带源路径哈希**（`transcode-<sha1前10>-<basename>.mp4`）：只用 basename 的话
+  `/a/clip.mp4` 与 `/b/clip.mp4` 会写到同一个文件上，两轮并发就会互相覆盖——症状是「用户收到了别人的视频」。
+- `public_url` 也进缓存（schema **v4**：`ALTER TABLE asset_uploads ADD COLUMN public_url`）——
+  文件类附件的正文就是那条链接，assetId 推不出 URL。v4 之前的老行读出来 `publicUrl=null`，
+  文件类按未命中处理（重传一次），媒体类照旧命中。
 > 与任务书原话「在 outbox 行里缓存 asset_id」的**取舍差异**：改用独立表，是为了不让通道去写 Core 的 outbox 载荷
 > （outbox 行的 `messageId` + `payload` 是投递层的不变量），同时天然获得跨消息去重。
 
@@ -143,9 +199,12 @@ Agent 只会说话，所以最终文本里的标记就是它唯一的出口。�
 waku-dm-reply --text "先给你看个中间结果"
 waku-dm-reply --image /tmp/shot.png --caption "第一版"
 waku-dm-reply --card cnt_abc --launch-ctx '{"room":"ABCD"}'
+waku-dm-reply --file /tmp/report.pdf --caption "跑完的报告"
 waku-dm-reply --conversation conv_01J… --video /tmp/demo.mp4 --text "跑起来了"
 ```
 
+- `--image` / `--video` / `--audio` / `--file` / `--card` 与同名标记**走同一段发送实现**，
+  行为逐字节一致（默认转码、抽封面、文件链接、白名单外回人话都一样）。
 - 传输：`POST http://127.0.0.1:<health-port>/admin/reply`，与 `/admin/pair-grant` 同一个**只听 127.0.0.1** 的运维口。
 - 端口发现：`WAKU_GATEWAY_HEALTH_PORT` → `<state>/health.port`（daemon 启动时写、退出时删）→ 缺省 `18092`。
 - **不猜会话**：不给 `--conversation` 时只认「当前**恰好一条**正在跑的 turn」；0 条或多条一律 400 并要求显式指定。
@@ -187,7 +246,7 @@ waku-dm-reply --conversation conv_01J… --video /tmp/demo.mp4 --text "跑起来
 | `WAKU_GATEWAY_MEDIA_TIMEOUT_MS` | 单次下载时限 | `60000` |
 | `WAKU_GATEWAY_MEDIA_TTL_MS` | 媒体文件寿命 | `86400000`（24h） |
 | `WAKU_GATEWAY_MEDIA_SWEEP_INTERVAL_MS` | 清理周期 | `3600000`（1h） |
-| `WAKU_DM_VIDEO_TRANSCODE` | `1` = 出站视频转 720p H.264 并截断到 `MAX_VIDEO_SECONDS`（需要 ffmpeg） | 关 |
+| `WAKU_DM_VIDEO_TRANSCODE` | 出站视频转 ≤720p H.264 + AAC + faststart 并截断到 `MAX_VIDEO_SECONDS`（需要 ffmpeg）。**默认开**；`0` / `false` / `off` / `no` 才关（其它值一律按开——别让一个笔误静默关掉它）。源已合规时自动跳过 | **开** |
 | `WAKU_GATEWAY_MAX_VIDEO_SECONDS` | 转码时的截断长度 | `60` |
 | `WAKU_GATEWAY_MAX_UPLOAD_BYTES` | **出站**单文件上限（上传要整个读进内存；超了回一句人话不发） | `209715200`（200 MiB） |
 | `WAKU_GATEWAY_NODE_ID` / `ENDPOINT_ID` / `TRUST_TIER` / `WORKSPACE_POLICY_ID` / `RUNNER_PROFILE_ID` / `QUEUE_CAP` / `OUTBOX_TTL_MS` / `FLUSH_INTERVAL_MS` | 沿用 V1 | 沿用 |
@@ -256,7 +315,10 @@ reconnects, tokenState: ready|stale|degraded|unloaded, selfUserId, sseState}`；
 | 心跳 403 | session 模式（真账号不是 bridge 身份） | 预期：session 模式心跳自动关闭；用 bridge 模式 |
 | Codex 说"我没看到图" | 正文里是 `[Image]` 还是 `[Image: /path]` | 无路径 = 下载失败，看日志 `media download failed` / `media too large`；有路径就是 Agent 侧问题 |
 | 语音发不出去，用户收到"装个 ffmpeg 就能发了" | 本机没有 ffprobe | `brew install ffmpeg`；平台要求 voice 必带 `duration_ms`，量不出来就不发（发出去必然 422） |
-| 视频发出去没有封面 | 同上，本机没有 ffmpeg | 同上；没有 ffmpeg 时视频**照发**，只是少封面少时长 |
+| 视频发出去没有封面 | 同上，本机没有 ffmpeg | 同上；没有 ffmpeg 时视频**照发**，只是少封面少时长、也不转码（可能在手机上播不了） |
+| 视频用户点开转圈圈播不了 | 本机没 ffmpeg，或有人设了 `WAKU_DM_VIDEO_TRANSCODE=0` | 装 ffmpeg / 去掉那个 env；日志里 `transcoding video (<reason>)` 一行能看出它有没有转 |
+| 收到「这个类型的文件发不了」 | `[[send-file:]]` 的扩展名不在白名单，或内容与扩展名对不上 | 打包成 `.zip` 再发；HTML 产物走 `waku ship` 成 playable 发卡片 |
+| 入站视频里 Codex "没看见画面" | 本机没 ffmpeg ⇒ 没有 `[VideoFrame:]` 那一行 | 装 ffmpeg（`brew install ffmpeg`）|
 | 卡片发不出去，回「内容不可分享」 | 内容不是 live 或 `visibility=private` | `waku publish … --visibility public` 重新发布后再分享；重试没用 |
 | `waku-dm-reply` 说 `no turn is running` / `2 turns are running` | 会话推断刻意不猜 | 把提示词前缀里的 `conv=…` 抄成 `--conversation <id>` |
 | `waku-dm-reply` 连不上 | daemon 没跑 / 端口没发现 | 看 `<state>/health.port`；或显式 `WAKU_GATEWAY_HEALTH_PORT=18092` |

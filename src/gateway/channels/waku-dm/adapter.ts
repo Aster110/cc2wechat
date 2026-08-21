@@ -19,6 +19,7 @@
  * 它们丢了没有代价，重投反而会在用户屏幕上堆出一排重复提示。
  */
 import { createHash } from 'node:crypto';
+import nodePath from 'node:path';
 
 import {
   CHANNEL_PROTOCOL_VERSION,
@@ -525,7 +526,34 @@ export function createWakuDmAdapter(options: WakuDmAdapterOptions): WakuDmAdapte
    * 三条：①正文（caption）永远在前，媒体标记跟在后面；②下载失败降级成无路径标记（`[Image]`）
    * 而不是丢整条消息；③卡片不下载任何东西，只转成一行文本标记——它本来就没有二进制。
    * 返回 null = 这个 kind 我们不认（sticker / 未知），交给调用方回提示。
+   *
+   * **视频额外抽一帧**（有 ffmpeg 时）：codex 的 turn input 只有 `localImage` / `localAudio`
+   * 两种媒体块，`.mp4` 只会退化成正文里的一行 `[附件] <path>`——模型能不能"看见"就取决于它
+   * 自己想不想去 shell 里跑 ffmpeg，而它经常不想。抽好的那一帧作为 `[VideoFrame: …]` 一起交上去，
+   * 画面就**必然**进模型的眼睛。没有 ffmpeg 就跳过（少一帧而已，视频路径照给）。
    */
+  /**
+   * 入站视频 → 同目录里的一张 jpg（`<video>.frame.jpg`）。
+   *
+   * 放在视频**同一个会话目录**里，于是 MediaStore 的 TTL 清理顺手就把它收了，不必再造一套寿命。
+   * 取第 1 秒而不是首帧：首帧常是黑场 / 淡入的第一格，抽出来等于没抽（`extractPoster` 内部
+   * 会在越过结尾时自动退回首帧）。任何一步失败都返回 null——少一帧不该影响这条消息本身。
+   */
+  async function extractInboundVideoFrame(videoPath: string): Promise<string | null> {
+    const probe = options.attachments?.probe;
+    if (probe === undefined || !probe.hasFfmpeg()) return null;
+    const frame = nodePath.join(
+      nodePath.dirname(videoPath),
+      `${nodePath.basename(videoPath, nodePath.extname(videoPath))}.frame.jpg`,
+    );
+    try {
+      return await probe.extractPoster(videoPath, frame, 1);
+    } catch (error) {
+      log.error(`   video frame extraction failed: ${describeInternalError(error)}`);
+      return null;
+    }
+  }
+
   async function composeInbound(message: WireChatMessage): Promise<{ text: string; mediaPaths: string[] } | null> {
     const caption = (message.body ?? '').trim();
     const parts: string[] = [];
@@ -549,6 +577,13 @@ export function createWakuDmAdapter(options: WakuDmAdapterOptions): WakuDmAdapte
       }
       parts.push(`[${label}: ${path}]`);
       mediaPaths.push(path);
+      if (kind === 'video') {
+        const frame = await extractInboundVideoFrame(path);
+        if (frame !== null) {
+          parts.push(`[VideoFrame: ${frame}]`);
+          mediaPaths.push(frame);
+        }
+      }
     }
 
     switch (message.kind) {

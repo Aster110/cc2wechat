@@ -115,7 +115,10 @@ export interface DmGatewayConfig {
   mediaTimeoutMs: number;
   mediaTtlMs: number;
   mediaSweepIntervalMs: number;
-  /** `WAKU_DM_VIDEO_TRANSCODE=1`：发视频前转到 720p H.264 并截断。默认关（不替用户改画质）。 */
+  /**
+   * 发视频前转到 ≤720p H.264 + AAC + faststart 并截断到 `maxVideoSeconds`。
+   * **默认开**（`WAKU_DM_VIDEO_TRANSCODE=0` 才关）：源已合规时会跳过转码，不白掉画质。
+   */
   videoTranscode: boolean;
   maxVideoSeconds: number;
   /** 出站单文件上限（上传要整个读进内存）。 */
@@ -246,7 +249,9 @@ export function loadDmGatewayConfig(env: NodeJS.ProcessEnv = process.env): DmGat
     mediaTimeoutMs: readInt(env, 'MEDIA_TIMEOUT_MS', WAKU_DM_DOWNLOAD_TIMEOUT_MS),
     mediaTtlMs: readInt(env, 'MEDIA_TTL_MS', WAKU_DM_MEDIA_TTL_MS),
     mediaSweepIntervalMs: readInt(env, 'MEDIA_SWEEP_INTERVAL_MS', WAKU_DM_MEDIA_SWEEP_INTERVAL_MS),
-    videoTranscode: (env['WAKU_DM_VIDEO_TRANSCODE'] ?? '').trim() === '1',
+    // **默认开**：客户端只保证能播 ≤60s/≤720p/h264+aac 的 mp4，而平台后端不转码。
+    // 显式 `0`（或 `false` / `off`）才关——不认识的值一律按开处理，别让一个笔误静默关掉它。
+    videoTranscode: !['0', 'false', 'off', 'no'].includes((env['WAKU_DM_VIDEO_TRANSCODE'] ?? '').trim().toLowerCase()),
     maxVideoSeconds: readInt(env, 'MAX_VIDEO_SECONDS', 60),
     maxUploadBytes: readInt(env, 'MAX_UPLOAD_BYTES', DEFAULT_MAX_UPLOAD_BYTES),
     codexHome: readEnv(env, 'CODEX_HOME'),
@@ -467,11 +472,13 @@ export function buildWakuDmGateway(options: BuildDmOptions): WakuDmGateway {
     // 上传缓存活在 SQLite：重启也不会让一个已经传上去的视频再传一次。
     cache: {
       get: (key: string) => store.getAssetUpload(key, now(), ASSET_CACHE_TTL_MS),
-      set: (key: string, assetId: string) => {
-        store.transaction((tx) => tx.saveAssetUpload(key, assetId, now()));
+      set: (key: string, value: { assetId: string; publicUrl: string | null }) => {
+        store.transaction((tx) => tx.saveAssetUpload(key, value, now()));
       },
     },
-    tmpDir: path.join(config.stateDir, 'outbound'),
+    // 转码 / 封面产物落在**媒体目录之下**（`<state>/media/out`），于是 MediaStore 的 TTL 清理
+    // 顺手就把它们收了；放在 `<state>/outbound` 的话没有任何东西会去删，盘只会单调涨。
+    tmpDir: path.join(config.mediaDir, 'out'),
     transcodeVideo: config.videoTranscode,
     maxVideoSeconds: config.maxVideoSeconds,
     maxUploadBytes: config.maxUploadBytes,

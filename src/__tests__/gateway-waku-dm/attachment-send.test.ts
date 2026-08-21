@@ -19,6 +19,7 @@ import {
 } from '../../gateway/channels/waku-dm/credential-provider.js';
 import {
   ASSET_CACHE_TTL_MS,
+  DEFAULT_MAX_VIDEO_SECONDS,
   internalFailureCode,
   type AssetUploadCache,
 } from '../../gateway/channels/waku-dm/attachment-sender.js';
@@ -47,29 +48,48 @@ function pngOf(width: number, height: number): Buffer {
   return Buffer.concat([header, ihdr, Buffer.alloc(16, 9)]);
 }
 
-interface ProbeStub extends MediaProbe {
-  posterCalls: number;
-  transcodeCalls: number;
+/** 一个「客户端能直接播」的探测结果：mp4 / h264 / aac / 1280x720 / 4.2s。 */
+function conformingAv(overrides: Partial<AvProbe> = {}): AvProbe {
+  return { width: 1280, height: 720, durationMs: 4200, videoCodec: 'h264', audioCodec: 'aac', hasAudio: true, ...overrides };
 }
 
-function stubProbe(options: { ffmpeg?: boolean; av?: AvProbe | null } = {}): ProbeStub {
+interface ProbeStub extends MediaProbe {
+  posterCalls: number;
+  /** 每次抽帧被要求的时刻（秒）——「首帧常是黑场」那条规则只能从这里验。 */
+  posterSeconds: number[];
+  transcodeCalls: number;
+  transcodeSeconds: number[];
+}
+
+function stubProbe(
+  options: { ffmpeg?: boolean; av?: AvProbe | null; transcodedAv?: AvProbe; transcodeFails?: boolean } = {},
+): ProbeStub {
   const ffmpeg = options.ffmpeg ?? true;
-  const av = options.av === undefined ? { width: 1280, height: 720, durationMs: 4200 } : options.av;
+  const av = options.av === undefined ? conformingAv() : options.av;
   const stub: ProbeStub = {
     posterCalls: 0,
+    posterSeconds: [],
     transcodeCalls: 0,
+    transcodeSeconds: [],
     hasFfmpeg: () => ffmpeg,
     imageDimensions: (filePath) => readImageDimensions(fs.readFileSync(filePath)),
-    probeAv: async () => (ffmpeg ? av : null),
-    extractPoster: async (_input, outPath) => {
+    // 转码产物要重新量一遍（payload 描述的是发出去的那个文件），所以它有自己的一份探测结果。
+    probeAv: async (filePath) => {
+      if (!ffmpeg) return null;
+      if (path.basename(filePath).startsWith('transcode-')) return options.transcodedAv ?? av;
+      return av;
+    },
+    extractPoster: async (_input, outPath, atSeconds = 0) => {
       stub.posterCalls += 1;
+      stub.posterSeconds.push(atSeconds);
       if (!ffmpeg) return null;
       fs.writeFileSync(outPath, pngOf(64, 36));
       return outPath;
     },
-    transcode: async (_input, outPath) => {
+    transcode: async (_input, outPath, maxSeconds) => {
       stub.transcodeCalls += 1;
-      if (!ffmpeg) return null;
+      stub.transcodeSeconds.push(maxSeconds);
+      if (!ffmpeg || options.transcodeFails === true) return null;
       fs.writeFileSync(outPath, Buffer.alloc(64, 5));
       return outPath;
     },
@@ -130,7 +150,7 @@ function makeAdapter(
       probe,
       cache: overrides.cache ?? {
         get: (key) => store.getAssetUpload(key, Date.now(), ASSET_CACHE_TTL_MS),
-        set: (key, assetId) => store.transaction((tx) => tx.saveAssetUpload(key, assetId, Date.now())),
+        set: (key, value) => store.transaction((tx) => tx.saveAssetUpload(key, value, Date.now())),
       },
       tmpDir: path.join(dir, 'outbound'),
       ...(overrides.transcodeVideo === undefined ? {} : { transcodeVideo: overrides.transcodeVideo }),
@@ -181,17 +201,20 @@ describe('waku-dm · 出站附件', () => {
     expect(server.messages[1].body).toBe('看这个');
   });
 
-  it('视频：有 ffmpeg 时抽封面 + 带宽高时长；封面自己也是一次上传', async () => {
+  it('视频：源已合规 → 不转码，抽封面 + 带宽高时长；封面自己也是一次上传', async () => {
     const adapter = makeAdapter();
     const file = writeFile('clip.mp4', Buffer.alloc(128, 3));
 
     expect((await adapter.send(finalWith([{ kind: 'video', path: file }], ''))).status).toBe('sent');
 
+    expect(probe.transcodeCalls).toBe(0); // mp4 / h264 / aac / 720p / 4.2s：再转一遍只会掉画质
     expect(probe.posterCalls).toBe(1);
+    expect(probe.posterSeconds).toEqual([1]); // 首帧常是黑场，取第 1 秒
     expect(server.uploads).toHaveLength(2); // 封面 + 视频
     const sent = server.richMessages[0].body as Record<string, Record<string, unknown>>;
     expect(sent['payload']).toMatchObject({ width: 1280, height: 720, duration_ms: 4200 });
     expect(typeof sent['payload']['poster_asset_id']).toBe('string');
+    expect(sent['body']).toBeUndefined(); // 没截断就不该多出一句话
   });
 
   it('没有 ffmpeg：视频照发（无封面无时长）并在日志里响一声；语音**不发**，改回一句人话', async () => {
@@ -217,7 +240,7 @@ describe('waku-dm · 出站附件', () => {
   });
 
   it('语音：有时长 → kind=voice 带 duration_ms', async () => {
-    probe = stubProbe({ av: { width: null, height: null, durationMs: 3300 } });
+    probe = stubProbe({ av: conformingAv({ width: null, height: null, durationMs: 3300, videoCodec: null }) });
     const adapter = makeAdapter();
     const voice = writeFile('note.m4a', Buffer.alloc(128, 4));
 
@@ -244,15 +267,6 @@ describe('waku-dm · 出站附件', () => {
     const text = server.messages.at(-1)!.body;
     expect(text).toContain('看看这个');
     expect(text).toContain('visibility public');
-  });
-
-  it('file 类型：Waku 私聊没有 file kind → 不硬塞，回一句"文件留在本机 <path>"', async () => {
-    const adapter = makeAdapter();
-    const file = writeFile('report.pdf', Buffer.alloc(32, 1));
-
-    expect((await adapter.send(finalWith([{ kind: 'file', path: file }], ''))).status).toBe('sent');
-    expect(server.uploads).toHaveLength(0);
-    expect(server.messages.at(-1)!.body).toContain(file);
   });
 
   it('超过出站上限 → 不读进内存、不上传，回一句人话（Agent 一句标记不该能撑爆 daemon）', async () => {
@@ -340,14 +354,199 @@ describe('waku-dm · 出站附件', () => {
     expect(server.messages[0].clientMsgId).toBe(attachmentClientMsgId(MSG, 0));
   });
 
-  it('WAKU_DM_VIDEO_TRANSCODE 打开时才转码', async () => {
-    const file = writeFile('clip.mp4', Buffer.alloc(128, 3));
-    await makeAdapter().send(finalWith([{ kind: 'video', path: file }], ''));
-    expect(probe.transcodeCalls).toBe(0);
+});
 
-    probe = stubProbe();
-    await makeAdapter({ transcodeVideo: true }).send(finalWith([{ kind: 'video', path: file }], '', '0198f4c1-1111-7000-8000-000000000003'));
+// ---------------------------------------------------------------------------
+
+describe('waku-dm · 出站视频默认可播', () => {
+  /**
+   * 为什么默认要转：客户端能稳定播的是 ≤60s / ≤720p / h264+aac / faststart 的 mp4，平台后端
+   * **不转码**。Agent 产出的视频五花八门（录屏 hevc、4K、webm、裸流），默认原样发的结果是
+   * 用户点开一个转圈圈——而那在用户那端没有任何补救办法。
+   */
+  it.each([
+    ['视频编码不是 h264', conformingAv({ videoCodec: 'hevc' }), 'clip.mp4'],
+    ['分辨率超 720p', conformingAv({ width: 3840, height: 2160 }), 'clip.mp4'],
+    ['容器不是 mp4', conformingAv(), 'clip.mov'],
+    ['ffprobe 探不出来', null, 'clip.mp4'],
+  ])('%s → 默认就转（不用等用户设 env）', async (_label, av, name) => {
+    probe = stubProbe({ av, transcodedAv: conformingAv() });
+    const adapter = makeAdapter();
+    const file = writeFile(name, Buffer.alloc(128, 3));
+
+    expect((await adapter.send(finalWith([{ kind: 'video', path: file }], ''))).status).toBe('sent');
+
     expect(probe.transcodeCalls).toBe(1);
+    expect(probe.transcodeSeconds).toEqual([DEFAULT_MAX_VIDEO_SECONDS]);
+    // 上传的是转码产物，不是源文件
+    expect(server.uploads.map((u) => u.filename)).toContain(
+      path.basename(fs.readdirSync(path.join(dir, 'outbound')).find((f) => f.startsWith('transcode-'))!),
+    );
+  });
+
+  it('WAKU_DM_VIDEO_TRANSCODE=0 → 一律不转，原样发（用户显式要求，不自作主张）', async () => {
+    probe = stubProbe({ av: conformingAv({ videoCodec: 'hevc', durationMs: 600_000 }) });
+    const adapter = makeAdapter({ transcodeVideo: false });
+    const file = writeFile('clip.mov', Buffer.alloc(128, 3));
+
+    expect((await adapter.send(finalWith([{ kind: 'video', path: file }], ''))).status).toBe('sent');
+    expect(probe.transcodeCalls).toBe(0);
+    expect((server.richMessages[0].body as Record<string, unknown>)['body']).toBeUndefined();
+  });
+
+  it('超 60s：截断并**在正文里说一句**（不说的话用户以为视频丢了一半）', async () => {
+    probe = stubProbe({
+      av: conformingAv({ durationMs: 90_000 }),
+      transcodedAv: conformingAv({ durationMs: 60_000 }),
+    });
+    const adapter = makeAdapter();
+    const file = writeFile('long.mp4', Buffer.alloc(128, 3));
+
+    expect((await adapter.send(finalWith([{ kind: 'video', path: file, caption: '看这个' }], ''))).status).toBe('sent');
+
+    const sent = server.richMessages[0].body as Record<string, Record<string, unknown>>;
+    // payload 描述的是**发出去的那个文件**，所以时长是转码后的 60s，不是源的 90s
+    expect(sent['payload']).toMatchObject({ duration_ms: 60_000 });
+    const body = String(sent['body']);
+    expect(body).toContain('看这个'); // caption 还在
+    expect(body).toContain('1:30'); // 原时长
+    expect(body).toContain('60s'); // 只发了这么多
+  });
+
+  it('转码失败 → 原样发并在日志里响一声（发不出去比画质差更糟）', async () => {
+    probe = stubProbe({ av: conformingAv({ videoCodec: 'hevc' }), transcodeFails: true });
+    const adapter = makeAdapter();
+    const file = writeFile('clip.mp4', Buffer.alloc(128, 3));
+
+    expect((await adapter.send(finalWith([{ kind: 'video', path: file }], ''))).status).toBe('sent');
+    expect(probe.transcodeCalls).toBe(1);
+    expect(server.uploads.map((u) => u.filename)).toContain('clip.mp4');
+    expect(log.find(/video transcode failed/)).toHaveLength(1);
+  });
+
+  it('转码产物按**源文件**做缓存 key：重投不会把刚转好的视频再传一遍', async () => {
+    probe = stubProbe({ av: conformingAv({ videoCodec: 'hevc' }), transcodedAv: conformingAv() });
+    const adapter = makeAdapter();
+    const file = writeFile('clip.mp4', Buffer.alloc(128, 3));
+    server.failNextSend({ status: 503, code: 'unavailable' });
+
+    expect(await adapter.send(finalWith([{ kind: 'video', path: file }], 'x'))).toMatchObject({ status: 'retryable' });
+    const afterFirst = server.uploads.length; // 封面 + 转码视频
+
+    expect((await adapter.send(finalWith([{ kind: 'video', path: file }], 'x'))).status).toBe('sent');
+
+    // 转码会再跑一次（产物 mtime 变了），但**上传**必须命中缓存——key 算的是源文件，不是产物。
+    expect(server.uploads).toHaveLength(afterFirst);
+    expect(log.find(/asset cache hit/).length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe('waku-dm · 出站文件 = 一条公开链接', () => {
+  /**
+   * Waku 私聊没有 `file` kind，也不为此新增（要动三端渲染 + 通知摘要 + 会话预览）。
+   * 走法是：传上传门拿 public_url → 发一条 `kind=text`：`📎 名字（大小）\n<url>`。
+   */
+  const PDF = Buffer.concat([Buffer.from('%PDF-1.7\n', 'utf8'), Buffer.alloc(64, 1)]);
+  const ZIP = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.alloc(64, 2)]);
+
+  it.each([
+    ['report.pdf', PDF, 'application/pdf'],
+    ['bundle.zip', ZIP, 'application/zip'],
+    ['notes.txt', Buffer.from('一段中文说明\n', 'utf8'), 'text/plain'],
+    ['AGENTS.md', Buffer.from('# title\n', 'utf8'), 'text/markdown'],
+    ['rows.csv', Buffer.from('a,b\n1,2\n', 'utf8'), 'text/csv'],
+    ['data.json', Buffer.from('{"ok":true}', 'utf8'), 'application/json'],
+  ])('%s → 上传（mime 对）+ 一条 text 消息带 📎 与可点的 URL', async (name, bytes, mime) => {
+    const adapter = makeAdapter();
+    const file = writeFile(name, bytes);
+
+    expect((await adapter.send(finalWith([{ kind: 'file', path: file }], ''))).status).toBe('sent');
+
+    expect(server.uploads).toHaveLength(1);
+    expect(server.uploads[0]).toMatchObject({ route: '/agent-bridges/me/assets', filename: name, mime, by: PERSONA });
+    const body = String(server.messages[0].body);
+    expect(server.messages[0].clientMsgId).toBe(attachmentClientMsgId(MSG, 0));
+    expect(body).toContain(`📎 ${name}`);
+    expect(body).toContain(server.uploads[0].assetId); // public_url 里带 asset id
+    expect(body).toMatch(/https?:\/\//);
+    // 发的是 text，不是硬塞成图片
+    expect(server.richMessages).toHaveLength(0);
+  });
+
+  it('caption 顶在链接前面', async () => {
+    const adapter = makeAdapter();
+    const file = writeFile('report.pdf', PDF);
+
+    await adapter.send(finalWith([{ kind: 'file', path: file, caption: '这是刚跑出来的报告' }], ''));
+
+    expect(String(server.messages[0].body)).toMatch(/^这是刚跑出来的报告\n📎 report\.pdf/);
+  });
+
+  it.each([['x.html'], ['x.svg'], ['run.py'], ['a.bin'], ['noext']])(
+    '%s：扩展名不在平台白名单 → 不上传（不烧配额、不烧带宽），回一句人话',
+    async (name) => {
+      const adapter = makeAdapter();
+      const file = writeFile(name, Buffer.from('<html><script>alert(1)</script>', 'utf8'));
+
+      expect((await adapter.send(finalWith([{ kind: 'file', path: file }], ''))).status).toBe('sent');
+      expect(server.uploads).toHaveLength(0);
+      const notice = server.messages.at(-1)!.body;
+      expect(notice).toContain(file);
+      expect(notice).toContain('发不了');
+    },
+  );
+
+  it.each([
+    ['扩展名 .pdf 但内容是 PNG', 'fake.pdf', () => pngOf(2, 3)],
+    ['扩展名 .txt 但内容含 NUL', 'fake.txt', () => Buffer.from([0x68, 0x00, 0x69])],
+    ['扩展名 .zip 但内容不是 zip', 'fake.zip', () => Buffer.from('not a zip at all', 'utf8')],
+  ])('%s → 本机就拦下，不上传', async (_label, name, make) => {
+    const adapter = makeAdapter();
+    const file = writeFile(name, make());
+
+    expect((await adapter.send(finalWith([{ kind: 'file', path: file }], ''))).status).toBe('sent');
+    expect(server.uploads).toHaveLength(0);
+    expect(server.messages.at(-1)!.body).toContain(file);
+    expect(log.find(/content does not match/)).toHaveLength(1);
+  });
+
+  it('平台 415（本机这张表比平台宽了）→ 降级成同一句人话，不是 permanent-failure', async () => {
+    const adapter = makeAdapter();
+    const file = writeFile('report.pdf', PDF);
+    server.failNextUpload({ status: 415, code: 'agent_bridge_asset_mime_rejected' });
+
+    // 整条 final 算发出去了：这条重投一万次也一样，但用户必须看到那句话
+    expect((await adapter.send(finalWith([{ kind: 'file', path: file }], ''))).status).toBe('sent');
+    expect(server.messages.at(-1)!.body).toContain(file);
+    expect(log.find(/rejected by the platform \(415/)).toHaveLength(1);
+  });
+
+  it('上传成功、发消息失败的重投**不重复上传**——URL 也走缓存', async () => {
+    const adapter = makeAdapter();
+    const file = writeFile('report.pdf', PDF);
+    server.failNextSend({ status: 503, code: 'unavailable' });
+
+    expect(await adapter.send(finalWith([{ kind: 'file', path: file }], 'x'))).toMatchObject({ status: 'retryable' });
+    expect(server.uploads).toHaveLength(1);
+
+    expect((await adapter.send(finalWith([{ kind: 'file', path: file }], 'x'))).status).toBe('sent');
+    expect(server.uploads).toHaveLength(1);
+    // 附件那条的 client_msg_id 固定，重投不会在屏幕上留下第二条
+    const link = server.messages.filter((m) => m.clientMsgId === attachmentClientMsgId(MSG, 0));
+    expect(link).toHaveLength(1);
+    expect(String(link[0].body)).toContain('📎 report.pdf');
+  });
+
+  it('.log 这类「不像文档」的扩展名也在表里（text/plain）—— agent 最常想发的就是日志', async () => {
+    const adapter = makeAdapter();
+    const file = writeFile('run.log', Buffer.from('line one\nline two\n', 'utf8'));
+
+    await adapter.send(finalWith([{ kind: 'file', path: file }], ''));
+
+    expect(server.uploads[0]).toMatchObject({ filename: 'run.log', mime: 'text/plain' });
+    expect(String(server.messages[0].body)).toContain('📎 run.log');
   });
 });
 

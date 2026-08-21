@@ -14,6 +14,7 @@ import { cardMarker, createWakuDmAdapter, parseChatMessage, type WakuDmAdapter }
 import { createWakuChatClient } from '../../gateway/channels/waku-dm/chat-client.js';
 import { createBridgeCredentialProvider, type BridgeTokenProvider } from '../../gateway/channels/waku-dm/credential-provider.js';
 import { createMediaStore } from '../../gateway/channels/waku-dm/media-store.js';
+import type { MediaProbe } from '../../gateway/channels/waku-dm/media-probe.js';
 import type { IngressAck } from '../../gateway/contracts/channel.js';
 import type { DmInboundEnvelope, InboundEnvelope } from '../../gateway/core/ingress.js';
 import { openGatewayStore, type GatewayStore } from '../../gateway/state/sqlite-store.js';
@@ -63,7 +64,29 @@ const sink = async (envelope: InboundEnvelope): Promise<IngressAck> => {
   return { status: 'accepted' };
 };
 
-async function startAdapter(withMedia = true): Promise<WakuDmAdapter> {
+/**
+ * 只为「入站视频抽帧」这一件事准备的 probe 替身：抽帧写一张真 jpg，其余方法都不该被走到。
+ * `ffmpeg:false` 用来测降级（没装 ffmpeg 时跳过抽帧，视频路径照给）。
+ */
+function framingProbe(options: { ffmpeg?: boolean; fails?: boolean } = {}): MediaProbe & { calls: Array<{ input: string; at: number }> } {
+  const ffmpeg = options.ffmpeg ?? true;
+  const calls: Array<{ input: string; at: number }> = [];
+  return {
+    calls,
+    hasFfmpeg: () => ffmpeg,
+    imageDimensions: () => ({ width: null, height: null }),
+    probeAv: async () => null,
+    extractPoster: async (input, outPath, atSeconds = 0) => {
+      calls.push({ input, at: atSeconds });
+      if (!ffmpeg || options.fails === true) return null;
+      fs.writeFileSync(outPath, Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]));
+      return outPath;
+    },
+    transcode: async () => null,
+  };
+}
+
+async function startAdapter(withMedia = true, probe?: MediaProbe): Promise<WakuDmAdapter> {
   const chat = createWakuChatClient({ apiBase: server.apiBase, tokens: provider });
   const adapter = createWakuDmAdapter({
     instanceId: 'waku-dm-test',
@@ -85,6 +108,7 @@ async function startAdapter(withMedia = true): Promise<WakuDmAdapter> {
           }),
         }
       : {}),
+    ...(probe === undefined ? {} : { attachments: { probe, tmpDir: path.join(dir, 'media', 'out') } }),
   });
   adapters.push(adapter);
   await adapter.start(sink);
@@ -171,6 +195,55 @@ describe('waku-dm · 入站媒体贯通', () => {
     await waitFor(() => envelopes.length === 2, { label: 'video + voice' });
     expect(envelopes[0].text).toMatch(/^\[Video: .+\.mp4\]$/);
     expect(envelopes[1].text).toMatch(/^\[Voice: .+\.m4a\]$/);
+    expect(envelopes[0].mediaPaths).toHaveLength(1);
+    expect(envelopes[1].mediaPaths).toHaveLength(1);
+  });
+
+  it('视频额外抽一帧：`[VideoFrame: …]` 与视频路径一起进 mediaPaths（模型才真的看得见画面）', async () => {
+    // 为什么需要它：codex 的 turn input 只有 localImage / localAudio 两种媒体块，
+    // 一个 .mp4 只会退化成正文里的一行 `[附件] <path>` —— 模型看不看得见画面，
+    // 取决于它想不想自己去 shell 里跑 ffmpeg，而它经常不想。
+    const probe = framingProbe();
+    await startAdapter(true, probe);
+    const videoUrl = server.seedBlob('clip.mp4', MP4, { contentType: 'video/mp4' });
+    server.emitMediaMessage({ conversationId: CONV, senderUserId: OWNER, kind: 'video', payload: { asset_id: 'a', url: videoUrl, duration_ms: 4200 } });
+
+    await waitFor(() => envelopes.length === 1, { label: 'video envelope' });
+    const [envelope] = envelopes;
+    const paths = envelope.mediaPaths as string[];
+    expect(paths).toHaveLength(2);
+    expect(paths[0]).toMatch(/\.mp4$/);
+    expect(paths[1]).toMatch(/\.frame\.jpg$/);
+    expect(fs.existsSync(paths[1])).toBe(true);
+    expect(envelope.text).toBe(`[Video: ${paths[0]}]\n[VideoFrame: ${paths[1]}]`);
+
+    // 首帧常是黑场 ⇒ 取第 1 秒（越过结尾时 extractPoster 内部会自己退回首帧）
+    expect(probe.calls).toEqual([{ input: paths[0], at: 1 }]);
+    // 帧就落在视频旁边 ⇒ MediaStore 的 TTL 清理顺手把它收了，不必再造一套寿命
+    expect(path.dirname(paths[1])).toBe(path.dirname(paths[0]));
+  });
+
+  it('没有 ffmpeg / 抽帧失败 → 跳过这一帧，视频路径照给（少一帧不该拖垮整条消息）', async () => {
+    await startAdapter(true, framingProbe({ ffmpeg: false }));
+    const videoUrl = server.seedBlob('clip.mp4', MP4, { contentType: 'video/mp4' });
+    server.emitMediaMessage({ conversationId: CONV, senderUserId: OWNER, kind: 'video', payload: { asset_id: 'a', url: videoUrl } });
+
+    await waitFor(() => envelopes.length === 1, { label: 'video envelope' });
+    expect(envelopes[0].mediaPaths).toHaveLength(1);
+    expect(envelopes[0].text).toMatch(/^\[Video: .+\.mp4\]$/);
+    expect(envelopes[0].text).not.toContain('VideoFrame');
+  });
+
+  it('只有视频抽帧：图片 / 语音不多出一个 VideoFrame', async () => {
+    const probe = framingProbe();
+    await startAdapter(true, probe);
+    const imageUrl = server.seedBlob('shot.png', PNG, { contentType: 'image/png' });
+    const voiceUrl = server.seedBlob('note.m4a', M4A, { contentType: 'audio/mp4' });
+    server.emitMediaMessage({ conversationId: CONV, senderUserId: OWNER, kind: 'image', image: { asset_id: 'a', url: imageUrl, width: 8, height: 8 } });
+    server.emitMediaMessage({ conversationId: CONV, senderUserId: OWNER, kind: 'voice', payload: { asset_id: 'b', url: voiceUrl, duration_ms: 3000 } });
+
+    await waitFor(() => envelopes.length === 2, { label: 'image + voice' });
+    expect(probe.calls).toEqual([]);
     expect(envelopes[0].mediaPaths).toHaveLength(1);
     expect(envelopes[1].mediaPaths).toHaveLength(1);
   });
