@@ -38,6 +38,7 @@ import type { MailboxChunk } from '../contracts/envelope.js';
 import type { AgentEndpoint, TrustTier } from '../contracts/runner.js';
 import { isTrustTier, type PairingScope, PAIRING_SCOPES } from '../contracts/pairing.js';
 import { gatewayError } from '../contracts/validation.js';
+import { createStatusHeartbeat } from '../core/status-heartbeat.js';
 
 import {
   createRuntimeCredentialProvider,
@@ -473,6 +474,8 @@ export interface WakuGatewayHealth extends GatewayHealth {
   mailbox: { ok: boolean; state: string; cursorLagMs: number; pendingOutbox: number };
   credential: { ok: boolean; state: string; expiresInSec: number };
   outbox: { pending: number };
+  /** 排障用：拍到哪了、上一拍什么结果。不含 routeId，符合 health 不外泄红线。 */
+  heartbeat: { lastBeatAt: number | null; lastResult: string | null };
 }
 
 export interface WakuGateway {
@@ -666,6 +669,35 @@ export function buildWakuGateway(options: BuildOptions): WakuGateway {
   });
   adapterRef = adapter;
 
+  // 在线心跳：adapter 早就有 heartbeat() 原语，缺的是打拍子的人。
+  // 只给已配对的长期路由写——握手中的 pr_ 路由客户端根本不读 status，写了纯浪费。
+  const heartbeat = createStatusHeartbeat({
+    routes: () =>
+      store
+        .listActivePairings()
+        .map((pairing) => ({ routeId: pairing.routeId, keyVersion: pairing.keyVersion })),
+    beat: (input) => adapter.heartbeat(input),
+    snapshot: async () => {
+      const core = await orchestrator.health();
+      const mailbox = await adapter.health();
+      const credential = credentials.health();
+      // 只交原始事实，`degraded/busy/online` 怎么推是 Core 的事（本文件只接线）。
+      return {
+        queuesRunning: core.queues.running,
+        queuesQueued: core.queues.queued,
+        credentialOk: credential.ok,
+        mailboxDegraded: mailbox.state === 'degraded',
+        endpointsAllOk: core.endpoints.every((endpoint) => endpoint.ok),
+      };
+    },
+    now,
+    timer: {
+      setTimeout: (fn, ms) => setTimeout(fn, ms) as unknown as number,
+      clearTimeout: (handle) => clearTimeout(handle as unknown as NodeJS.Timeout),
+    },
+    log: (line) => console.log(`[waku-gateway ${new Date(now()).toISOString()}] ${line}`),
+  });
+
   let flushTimer: NodeJS.Timeout | null = null;
   let stopped = false;
 
@@ -692,12 +724,17 @@ export function buildWakuGateway(options: BuildOptions): WakuGateway {
         void delivery.flushPending().catch(() => undefined);
       }, config.flushIntervalMs);
       if (typeof flushTimer.unref === 'function') flushTimer.unref();
+
+      heartbeat.start();
     },
 
     async stop(): Promise<void> {
       if (stopped) return;
       stopped = true;
       if (flushTimer !== null) clearInterval(flushTimer);
+      // 墓碑必须写在 adapter.stop() 之前：adapter 一停，heartbeat() 就只回
+      // waku_mailbox_stopped，这一拍 offline 会变成空转，徽章得干等 180s 陈旧化。
+      await heartbeat.stop({ tombstone: true });
       await adapter.stop();
       await orchestrator.drain();
       // 排水之后再冲一次：最后那条 final 也要落到 Waku 上。
@@ -724,6 +761,7 @@ export function buildWakuGateway(options: BuildOptions): WakuGateway {
           expiresInSec: credential.expiresInSec,
         },
         outbox: { pending: delivery.pendingCount() },
+        heartbeat: heartbeat.health(),
       };
     },
 

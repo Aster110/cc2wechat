@@ -70,8 +70,10 @@ export interface PollConfig {
 export const WAKU_POLL_DEFAULTS: PollConfig = {
   activeMinMs: 1000,
   activeMaxMs: 2000,
-  idleMinMs: 10_000,
-  idleMaxMs: 30_000,
+  // 空闲档不是"省"，是延迟地板：用户隔几小时发第一条，正撞在这个间隙里。
+  // 实测旧值（10~30s）冷启平均白等 ~20s，而这一档只值 ~11 读/min（读预算的 3.6%）。
+  idleMinMs: 3_000,
+  idleMaxMs: 8_000,
   idleAfterEmptyPolls: 3,
 };
 

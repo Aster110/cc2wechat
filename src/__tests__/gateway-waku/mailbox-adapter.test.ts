@@ -611,8 +611,8 @@ describe('M2 · WakuMailboxAdapter 描述符与生命周期', () => {
     });
     expect(mod.WAKU_POLL_DEFAULTS.activeMinMs).toBe(1000);
     expect(mod.WAKU_POLL_DEFAULTS.activeMaxMs).toBe(2000);
-    expect(mod.WAKU_POLL_DEFAULTS.idleMinMs).toBe(10_000);
-    expect(mod.WAKU_POLL_DEFAULTS.idleMaxMs).toBe(30_000);
+    expect(mod.WAKU_POLL_DEFAULTS.idleMinMs).toBe(3_000);
+    expect(mod.WAKU_POLL_DEFAULTS.idleMaxMs).toBe(8_000);
   });
 
   it('start 先跑完一轮再 resolve，stop 后清空所有排期', async () => {
@@ -1161,10 +1161,10 @@ describe('M2 · WakuMailboxAdapter 自适应轮询', () => {
 
     await scheduler.advance(1000);
     await scheduler.advance(1000);
-    expect(scheduler.pendingDelays()).toEqual([10_000]);
+    expect(scheduler.pendingDelays()).toEqual([3_000]);
 
     seedInbound({ routeId: ROUTE_A, messageId: uuid('u1'), createdAt: scheduler.now() + 1 });
-    await scheduler.advance(10_000);
+    await scheduler.advance(3_000);
     expect(received).toHaveLength(1);
     expect(scheduler.pendingDelays()).toEqual([1000]);
     await adapter.stop();
