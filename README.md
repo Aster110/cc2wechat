@@ -274,25 +274,36 @@ node dist/gateway/server.js
 | `CC2WECHAT_ACK_MS` | Slow-turn notice (“收到，正在处理…”); `0` disables | `60000` |
 | `WAKU_GATEWAY_MEDIA_DIR` / `MEDIA_TTL_MS` / `MEDIA_SWEEP_INTERVAL_MS` | Where inbound media lands, how long it lives, how often it is swept | `<state>/media` / `86400000` / `3600000` |
 | `WAKU_GATEWAY_MEDIA_IMAGE_MAX_BYTES` / `MEDIA_MAX_BYTES` / `MEDIA_TIMEOUT_MS` | Inbound size caps (image / video+voice) and per-download timeout | `16MiB` / `100MiB` / `60000` |
-| `WAKU_DM_VIDEO_TRANSCODE` / `WAKU_GATEWAY_MAX_UPLOAD_BYTES` | Transcode outbound video to 720p H.264 (needs ffmpeg); outbound per-file cap | off / `200MiB` |
+| `WAKU_DM_VIDEO_TRANSCODE` / `WAKU_GATEWAY_MAX_VIDEO_SECONDS` / `WAKU_GATEWAY_MAX_UPLOAD_BYTES` | Transcode outbound video to ≤720p H.264 + AAC + faststart (needs ffmpeg; **on by default**, `0`/`false`/`off`/`no` disables, skipped when the source already conforms); truncation length; outbound per-file cap | **on** / `60` / `200MiB` |
 | `WAKU_GATEWAY_WORKSPACE_DIR` / `AGENT_BACKEND` / `CODEX_HOME` / `CODEX_EFFORT` / `NODE_ID` / `ENDPOINT_ID` / `TRUST_TIER` | Same as the V1 gateway | same |
 
 Commands inside the DM: `/new` (fresh context, same conversation), `/stop`, `/exit`, `/help`.
 
 **Media & attachments.** Inbound: the daemon downloads the file into `<state>/media/<conv>/<msg>-<i>.<ext>`
 (capped, 60s timeout, swept after 24h) and appends `[Image: /path]` / `[Video: /path]` / `[Voice: /path]`
-to the text, so Codex gets real local paths (`localImage` / `localAudio`); shared playables become a text
+to the text, so Codex gets real local paths (`localImage` / `localAudio`); a video additionally gets one
+extracted frame next to it as `[VideoFrame: /path.frame.jpg]`, because Codex's turn input has no video
+block — without that frame the model only sees a file path. Shared playables become a text
 `[Card: <title> content_id=… share_url=…]` marker. Outbound: Codex writes `[[send-image: /abs/path]]`,
-`[[send-video: …]]`, `[[send-audio: …]]`, `[[send-card: cnt_… launch_ctx={"room":"AB"}]]` in its final
-answer, or calls `waku-dm-reply --image /tmp/shot.png` mid-turn (loopback HTTP to the daemon's ops port;
-without `--conversation` it targets the single running turn and refuses to guess when there are zero or
-several). Install the Codex-facing skill with `cc2wechat skill install waku-dm`.
+`[[send-video: …]]`, `[[send-audio: …]]`, `[[send-file: /abs/report.pdf]]`,
+`[[send-card: cnt_… launch_ctx={"room":"AB"}]]` in its final answer, or calls
+`waku-dm-reply --image /tmp/shot.png` mid-turn (loopback HTTP to the daemon's ops port; without
+`--conversation` it targets the single running turn and refuses to guess when there are zero or several).
+Outbound video is transcoded to a phone-playable mp4 by default (skipped when the source already conforms).
+Waku DMs have no `file` message kind, so `[[send-file:]]` uploads the document and sends a **text message
+with the public link** (`📎 name（size）` + URL) — allowed: pdf / zip / txt / log / md / csv / json;
+anything a browser would execute (html / svg / js) is refused with a human sentence, because HTML artifacts
+belong in `waku ship` → a playable card. Install the Codex-facing skill with `cc2wechat skill install waku-dm`.
 
 Health: `node dist/gateway/cli.js health` (with `WAKU_GATEWAY_CHANNEL=waku-dm`) or `curl 127.0.0.1:18092/health` —
 `channel: {type, state, cursor, lastEventAt, lastHeartbeatAt, reconnects, tokenState, selfUserId}` plus the V1 `core/runner/endpoints/queues/outbox` blocks.
 Read-only transport smoke against the real backend: `node dist/gateway/server.js --sse-smoke 15` (prints event names and seqs only).
 Golden path: `PERSONA_USER_ID=<id> node scripts/golden-e2e-dm.mjs`;
-media golden path (image in → Codex reads the nonce → image out): `PERSONA_USER_ID=<id> node scripts/golden-e2e-dm-media.mjs`.
+media golden path (image in → Codex reads the nonce → image out): `PERSONA_USER_ID=<id> node scripts/golden-e2e-dm-media.mjs`;
+video golden path (video in → Codex reads the burned-in nonce off the extracted frame → playable video out with a poster):
+`PERSONA_USER_ID=<id> node scripts/golden-e2e-dm-video.mjs` (needs ffmpeg on this box);
+file golden path (ask it to send a local file → a text message with 📎 and a fetchable URL):
+`PERSONA_USER_ID=<id> node scripts/golden-e2e-dm-file.mjs`.
 
 ## License
 

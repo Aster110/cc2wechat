@@ -121,7 +121,7 @@ type GatewayTransaction = {
   }): void;
   insertInboxReceipt(r: ReceiptRow): 'inserted' | 'duplicate';
   commitCursor(collection: string, cursor: CursorRow): void;
-  saveAssetUpload(cacheKey: string, assetId: string, createdAt: number): void;
+  saveAssetUpload(cacheKey: string, upload: { assetId: string; publicUrl: string | null }, createdAt: number): void;
   insertOutbox(o: Omit<OutboxRow, 'status' | 'attempts' | 'externalDeliveryId'>): 'inserted' | 'duplicate';
   markOutboxSent(messageId: string, externalDeliveryId: string, sentAt: number): void;
   saveConversation(c: ConversationRow): void;
@@ -140,7 +140,7 @@ type GatewayStoreApi = {
   getPairingSecret(id: string): Uint8Array | null;
   getReceipt(pairingId: string, messageId: string): ReceiptRow | null;
   getCursor(collection: string): CursorRow | null;
-  getAssetUpload(cacheKey: string, now: number, maxAgeMs: number): string | null;
+  getAssetUpload(cacheKey: string, now: number, maxAgeMs: number): { assetId: string; publicUrl: string | null } | null;
   getOutbox(messageId: string): OutboxRow | null;
   listPendingOutbox(): OutboxRow[];
   getConversation(id: string): ConversationRow | null;
@@ -434,8 +434,8 @@ describe('M1 · schema 与 migration', () => {
     // 出站附件上传前的那次缓存查询：老库上它抛 `no such table: asset_uploads`，
     // 于是每 30s 重投一次、永远失败。补出来之后它必须能读能写。
     expect(store.getAssetUpload('k-1', NOW, 60_000)).toBeNull();
-    store.transaction((tx) => tx.saveAssetUpload('k-1', 'ast_1', NOW));
-    expect(store.getAssetUpload('k-1', NOW, 60_000)).toBe('ast_1');
+    store.transaction((tx) => tx.saveAssetUpload('k-1', { assetId: 'ast_1', publicUrl: null }, NOW));
+    expect(store.getAssetUpload('k-1', NOW, 60_000)).toEqual({ assetId: 'ast_1', publicUrl: null });
 
     // 老数据原样保留：这是补版本，不是重建库
     expect(store.getEndpoint('aster-admin')).toEqual(ADMIN_ENDPOINT);
@@ -475,8 +475,35 @@ describe('M1 · schema 与 migration', () => {
     db.close();
 
     const store = await openStore();
-    expect(store.getAssetUpload('k-hand', NOW, 60_000)).toBe('ast_hand'); // 手工期的缓存没被推平
+    // 手工期的缓存没被推平；v4 的 ADD COLUMN 也在这张手工表上跑得通（它本来就没有 public_url）
+    expect(store.getAssetUpload('k-hand', NOW, 60_000)).toEqual({ assetId: 'ast_hand', publicUrl: null });
     expect(store.getEndpoint('aster-admin')).toEqual(ADMIN_ENDPOINT);
+    store.close();
+
+    expect(dbUserVersion(dbPath)).toBe(await schemaVersion());
+  });
+
+  it('v3 老库补出 public_url 列：老行照旧能用（URL 读出来是 null，不是错误）', async () => {
+    // 文件类附件的正文就是那条公开链接，而 v4 之前的缓存行里没有它。
+    // 这条 case 钉的是「补列不是重建」：老 asset_id 必须原样还在，URL 缺就缺，
+    // 调用方据此决定重传一次——而不是整个缓存被推平、或者读出来直接抛。
+    const db = new DatabaseSync(dbPath);
+    db.exec(`
+      CREATE TABLE asset_uploads (
+        cache_key TEXT PRIMARY KEY,
+        asset_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      INSERT INTO asset_uploads (cache_key, asset_id, created_at) VALUES ('k-v3', 'ast_v3', ${NOW});
+      PRAGMA user_version = 3;
+    `);
+    db.close();
+
+    const store = await openStore();
+    expect(store.getAssetUpload('k-v3', NOW, 60_000)).toEqual({ assetId: 'ast_v3', publicUrl: null });
+    // 新写入的行两个字段都在
+    store.transaction((tx) => tx.saveAssetUpload('k-v4', { assetId: 'ast_v4', publicUrl: 'https://cdn/f.pdf' }, NOW));
+    expect(store.getAssetUpload('k-v4', NOW, 60_000)).toEqual({ assetId: 'ast_v4', publicUrl: 'https://cdn/f.pdf' });
     store.close();
 
     expect(dbUserVersion(dbPath)).toBe(await schemaVersion());
@@ -484,8 +511,8 @@ describe('M1 · schema 与 migration', () => {
 
   it('全新库一次建到最新版本，asset_uploads 当场可用', async () => {
     const store = await openStore();
-    store.transaction((tx) => tx.saveAssetUpload('k-new', 'ast_new', NOW));
-    expect(store.getAssetUpload('k-new', NOW, 60_000)).toBe('ast_new');
+    store.transaction((tx) => tx.saveAssetUpload('k-new', { assetId: 'ast_new', publicUrl: 'https://cdn/x' }, NOW));
+    expect(store.getAssetUpload('k-new', NOW, 60_000)).toEqual({ assetId: 'ast_new', publicUrl: 'https://cdn/x' });
     const latest = await schemaVersion();
     expect(store.schemaVersion).toBe(latest);
     store.close();

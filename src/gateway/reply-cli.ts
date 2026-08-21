@@ -4,6 +4,7 @@
  *
  *   waku-dm-reply --text "先给你看个东西"
  *   waku-dm-reply --image /tmp/shot.png
+ *   waku-dm-reply --file /tmp/report.pdf --caption "跑完的报告"
  *   waku-dm-reply --card cnt_abc --launch-ctx '{"room":"ABCD"}'
  *   waku-dm-reply --conversation conv_01J… --video /tmp/demo.mp4 --text "跑起来了"
  *
@@ -45,8 +46,9 @@ const USAGE = `用法：waku-dm-reply [--conversation <conv_id>] [--text <文本
 
   --text <文本>              发一段文字（也可以直接把 [[send-image: …]] 标记写在文本里）
   --image <路径>             发图片（PNG/JPEG/GIF/WEBP）
-  --video <路径>             发视频（有 ffmpeg 时自动抽封面、量时长）
+  --video <路径>             发视频（默认先转成 ≤60s/≤720p/H.264 的可播 mp4，并抽封面、量时长）
   --audio <路径>             发语音（需要 ffprobe 量时长，否则会明确告诉你没发出去）
+  --file <路径>              发文件（pdf/zip/txt/log/md/csv/json）：上传后以一条带公开链接的文字消息发出
   --card <cnt_id>            发一张 playable 卡片（内容必须已发布且 visibility=public/friends）
   --launch-ctx <json>        跟在 --card 后面：进入 playable 时带的启动上下文，值必须是字符串
   --caption <文本>           跟在附件后面：这条附件的说明文字
@@ -67,7 +69,7 @@ export function parseReplyArgs(argv: readonly string[]): ReplyCliRequest {
   };
   const last = (flag: string): ReplyCliAttachment => {
     const entry = attachments.at(-1);
-    if (entry === undefined) throw new Error(`${flag} must follow an attachment flag (--image/--video/--audio/--card)`);
+    if (entry === undefined) throw new Error(`${flag} must follow an attachment flag (--image/--video/--audio/--file/--card)`);
     return entry;
   };
 
