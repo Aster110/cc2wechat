@@ -19,7 +19,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import type { OutboundAttachment } from '../../core/attachments.js';
-import type { GatewayLogger } from '../../log.js';
+import { describeInternalError, type GatewayLogger } from '../../log.js';
 import { isWakuApiError, type WakuChatClient } from './chat-client.js';
 import { mimeForPath, type MediaProbe } from './media-probe.js';
 
@@ -47,7 +47,14 @@ export type AttachmentOutcome =
   /** 发不出去，但这不是"待重试"——回一句人话，然后翻篇。 */
   | { status: 'skipped'; notice: string }
   /** 交给 outbox：`retryable` 会重投，`permanent-failure` 不会。 */
-  | { status: 'failed'; kind: 'retryable' | 'permanent-failure' | 'unknown'; code: string; retryAfterMs?: number };
+  | {
+      status: 'failed';
+      kind: 'retryable' | 'permanent-failure' | 'unknown';
+      code: string;
+      retryAfterMs?: number;
+      /** 本机内部错误的原始描述（已截断）。平台侧失败没有它 —— code 就说明了一切。 */
+      detail?: string;
+    };
 
 export const DEFAULT_MAX_VIDEO_SECONDS = 60;
 /**
@@ -68,18 +75,26 @@ export function assetCacheKey(filePath: string): string | null {
   }
 }
 
-function failureFrom(error: unknown): Extract<AttachmentOutcome, { status: 'failed' }> {
-  if (!isWakuApiError(error)) return { status: 'failed', kind: 'unknown', code: 'send_failed' };
-  if (error.kind === 'network') return { status: 'failed', kind: 'unknown', code: error.code };
-  if (error.kind === 'auth') return { status: 'failed', kind: 'retryable', code: error.code };
-  const status = error.status ?? 0;
-  if (status === 429) {
-    return error.retryAfterMs === null
-      ? { status: 'failed', kind: 'retryable', code: error.code }
-      : { status: 'failed', kind: 'retryable', code: error.code, retryAfterMs: error.retryAfterMs };
+/** 回执 code 里的标签最长这么长：它会进日志和 outbox 记录，不该被一个畸形 code 撑爆。 */
+const FAILURE_TAG_MAX = 48;
+
+/**
+ * 本机内部错误 → 回执 code。
+ *
+ * 标签优先用 `error.code`（sqlite 给的是 `ERR_SQLITE_ERROR`），没有才退回 `error.name`——
+ * Node 里几乎所有东西的 name 都是 `Error`，只看 name 分不出任何东西。
+ * 只保留安全字符：这个 code 会被原样写进日志和 outbox。
+ */
+export function internalFailureCode(error: unknown): string {
+  let raw: string;
+  if (error instanceof Error) {
+    const code = (error as Error & { code?: unknown }).code;
+    raw = typeof code === 'string' && code.length > 0 ? code : error.name;
+  } else {
+    raw = typeof error;
   }
-  if (status === 408 || status === 425 || status >= 500) return { status: 'failed', kind: 'retryable', code: error.code };
-  return { status: 'failed', kind: 'permanent-failure', code: error.code };
+  const safe = raw.replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, FAILURE_TAG_MAX);
+  return `attachment_internal:${safe.length === 0 ? 'unknown' : safe}`;
 }
 
 /** 内容不可分享（private / 已下线 / 不存在）——这是**内容状态**问题，重投一万次也一样。 */
@@ -101,6 +116,36 @@ export function createAttachmentSender(
 ): AttachmentSender {
   const maxVideoSeconds = config.maxVideoSeconds ?? DEFAULT_MAX_VIDEO_SECONDS;
   const maxUploadBytes = config.maxUploadBytes ?? DEFAULT_MAX_UPLOAD_BYTES;
+
+  /**
+   * 失败原样交回上游，**但内部错误不许被吞掉**。
+   *
+   * 非 `WakuApiError` = 平台还没参与，是我们自己炸了（DB / fs / 解码）。以前这里一律回
+   * `send_failed` 且一行日志都不写：`no such table: asset_uploads` 落到运维眼里只剩
+   * "attachment=1/1 (image): send_failed"，每 30s 重投一次、永远失败，也看不出为什么。
+   * 现在原始 message 记一行、code 带上错误标签——一眼分得出"平台拒了"和"我们自己炸了"。
+   *
+   * kind 仍是 `unknown`：内部错误发生在发送之前还是之后，这里判断不了，重试语义不动。
+   */
+  function failureFrom(error: unknown): Extract<AttachmentOutcome, { status: 'failed' }> {
+    if (!isWakuApiError(error)) {
+      const detail = describeInternalError(error);
+      log.error(`   attachment internal error: ${detail}`);
+      return { status: 'failed', kind: 'unknown', code: internalFailureCode(error), detail };
+    }
+    if (error.kind === 'network') return { status: 'failed', kind: 'unknown', code: error.code };
+    if (error.kind === 'auth') return { status: 'failed', kind: 'retryable', code: error.code };
+    const status = error.status ?? 0;
+    if (status === 429) {
+      return error.retryAfterMs === null
+        ? { status: 'failed', kind: 'retryable', code: error.code }
+        : { status: 'failed', kind: 'retryable', code: error.code, retryAfterMs: error.retryAfterMs };
+    }
+    if (status === 408 || status === 425 || status >= 500) {
+      return { status: 'failed', kind: 'retryable', code: error.code };
+    }
+    return { status: 'failed', kind: 'permanent-failure', code: error.code };
+  }
 
   /** 上传一个本机文件，命中缓存就不走网络。 */
   async function uploadCached(filePath: string): Promise<string> {

@@ -28,7 +28,7 @@ import {
 } from '../../contracts/channel.js';
 import type { OutboundEnvelope } from '../../core/delivery.js';
 import type { DmInboundEnvelope, InboundEnvelope } from '../../core/ingress.js';
-import type { GatewayLogger } from '../../log.js';
+import { describeInternalError, type GatewayLogger } from '../../log.js';
 import type { GatewayStore } from '../../state/sqlite-store.js';
 import { splitText, stripMarkdown } from '../../../v5/sender/replier.js';
 import { createAttachmentSender, type AttachmentSenderConfig } from './attachment-sender.js';
@@ -713,7 +713,11 @@ export function createWakuDmAdapter(options: WakuDmAdapterOptions): WakuDmAdapte
         notices.push(outcome.notice);
         continue;
       }
-      log.error(`send failed ${context} attachment=${index + 1}/${attachments.length} (${attachment.kind}): ${outcome.code}`);
+      // 内部错误把 detail 也带上：运维只看得到这一行，只剩一个 code 等于什么都没说。
+      const detail = outcome.detail === undefined ? '' : ` — ${outcome.detail}`;
+      log.error(
+        `send failed ${context} attachment=${index + 1}/${attachments.length} (${attachment.kind}): ${outcome.code}${detail}`,
+      );
       if (outcome.kind === 'unknown') return { status: 'unknown', code: outcome.code };
       if (outcome.kind === 'permanent-failure') return { status: 'permanent-failure', code: outcome.code };
       return outcome.retryAfterMs === undefined
@@ -844,9 +848,7 @@ export function createWakuDmAdapter(options: WakuDmAdapterOptions): WakuDmAdapte
 
 function describeError(error: unknown): string {
   if (isWakuApiError(error)) return `${error.code}${error.status === null ? '' : ` (HTTP ${error.status})`}`;
-  if (error instanceof Error) {
-    const code = (error as Error & { code?: unknown }).code;
-    return typeof code === 'string' ? code : error.message;
-  }
-  return String(error);
+  // 同一个坑的另一半：以前有 `code` 就只记 code，message 被丢掉——
+  // `ERR_SQLITE_ERROR` 单独出现同样定位不了任何东西。两个都留。
+  return describeInternalError(error);
 }
