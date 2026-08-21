@@ -18,6 +18,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 import type { AgentAdapter } from '../../v6/contracts.js';
 import type { AgentEndpoint, TrustTier } from '../contracts/runner.js';
@@ -46,6 +47,19 @@ import {
   type WakuDmAdapter,
   type WakuDmHealth,
 } from '../channels/waku-dm/adapter.js';
+import {
+  createMediaStore,
+  WAKU_DM_DOWNLOAD_TIMEOUT_MS,
+  WAKU_DM_IMAGE_MAX_BYTES,
+  WAKU_DM_MEDIA_MAX_BYTES,
+  WAKU_DM_MEDIA_SWEEP_INTERVAL_MS,
+  WAKU_DM_MEDIA_TTL_MS,
+  type MediaStore,
+} from '../channels/waku-dm/media-store.js';
+import { createMediaProbe } from '../channels/waku-dm/media-probe.js';
+import { ASSET_CACHE_TTL_MS, DEFAULT_MAX_UPLOAD_BYTES } from '../channels/waku-dm/attachment-sender.js';
+import { mergeAttachments, parseAttachmentMarkers, type OutboundAttachment } from '../core/attachments.js';
+import { DEFAULT_DM_STATE_DIR_NAME, HEALTH_PORT_FILE } from '../dm-paths.js';
 import { SSE_IDLE_TIMEOUT_MS } from '../channels/waku-dm/sse-client.js';
 import {
   DEFAULT_DM_HEALTH_PORT,
@@ -94,12 +108,25 @@ export interface DmGatewayConfig {
   /** 0 = 关闭慢回执。来自 `CC2WECHAT_ACK_MS`（沿用 v6）。 */
   slowAckMs: number;
   coldStartGraceMs: number;
+  /** 入站媒体落盘目录（缺省 `<stateDir>/media`）与三道闸。 */
+  mediaDir: string;
+  mediaImageMaxBytes: number;
+  mediaMaxBytes: number;
+  mediaTimeoutMs: number;
+  mediaTtlMs: number;
+  mediaSweepIntervalMs: number;
+  /** `WAKU_DM_VIDEO_TRANSCODE=1`：发视频前转到 720p H.264 并截断。默认关（不替用户改画质）。 */
+  videoTranscode: boolean;
+  maxVideoSeconds: number;
+  /** 出站单文件上限（上传要整个读进内存）。 */
+  maxUploadBytes: number;
   codexHome: string | null;
   codexEffort: string | null;
   agentBackend: string | null;
 }
 
-export const DEFAULT_DM_STATE_DIR_NAME = '.waku-gateway-dm';
+/** 唯一定义在 `../dm-paths.js`（那个文件没有任何 import，CLI 拿常量不必拖进整条依赖链）。 */
+export { DEFAULT_DM_STATE_DIR_NAME, HEALTH_PORT_FILE };
 export const DEFAULT_GUEST_ENDPOINT_ID = 'guest';
 export const DEFAULT_GUEST_WORKSPACE_POLICY_ID = 'guest-home';
 
@@ -213,6 +240,15 @@ export function loadDmGatewayConfig(env: NodeJS.ProcessEnv = process.env): DmGat
     sseIdleTimeoutMs: readInt(env, 'SSE_IDLE_TIMEOUT_MS', SSE_IDLE_TIMEOUT_MS),
     slowAckMs: readNonNegativeMs(env, 'CC2WECHAT_ACK_MS', WAKU_DM_SLOW_ACK_MS),
     coldStartGraceMs: readInt(env, 'COLD_START_GRACE_MS', WAKU_DM_COLD_START_GRACE_MS),
+    mediaDir: readEnv(env, 'MEDIA_DIR') ?? path.join(stateDir, 'media'),
+    mediaImageMaxBytes: readInt(env, 'MEDIA_IMAGE_MAX_BYTES', WAKU_DM_IMAGE_MAX_BYTES),
+    mediaMaxBytes: readInt(env, 'MEDIA_MAX_BYTES', WAKU_DM_MEDIA_MAX_BYTES),
+    mediaTimeoutMs: readInt(env, 'MEDIA_TIMEOUT_MS', WAKU_DM_DOWNLOAD_TIMEOUT_MS),
+    mediaTtlMs: readInt(env, 'MEDIA_TTL_MS', WAKU_DM_MEDIA_TTL_MS),
+    mediaSweepIntervalMs: readInt(env, 'MEDIA_SWEEP_INTERVAL_MS', WAKU_DM_MEDIA_SWEEP_INTERVAL_MS),
+    videoTranscode: (env['WAKU_DM_VIDEO_TRANSCODE'] ?? '').trim() === '1',
+    maxVideoSeconds: readInt(env, 'MAX_VIDEO_SECONDS', 60),
+    maxUploadBytes: readInt(env, 'MAX_UPLOAD_BYTES', DEFAULT_MAX_UPLOAD_BYTES),
     codexHome: readEnv(env, 'CODEX_HOME'),
     codexEffort: readEnv(env, 'CODEX_EFFORT'),
     agentBackend: readEnv(env, 'AGENT_BACKEND'),
@@ -229,6 +265,21 @@ export interface WakuDmGatewayHealth extends GatewayHealth {
   outbox: { pending: number };
 }
 
+/** 回环回复口的入参（`waku-dm-reply` CLI → `POST /admin/reply`）。 */
+export interface DmReplyInput {
+  /** 不给就用"当前唯一正在跑的 turn 的会话"；0 条或多于 1 条 → 报错要求显式指定。 */
+  conversationId?: string;
+  text?: string;
+  attachments?: OutboundAttachment[];
+}
+
+export interface DmReplyResult {
+  conversationId: string;
+  messageId: string;
+  status: string;
+  attachments: number;
+}
+
 export interface WakuDmGateway {
   readonly config: DmGatewayConfig;
   readonly store: GatewayStore;
@@ -238,9 +289,12 @@ export interface WakuDmGateway {
   readonly ingress: CoreIngress;
   readonly adapter: WakuDmAdapter;
   readonly credentials: BridgeTokenProvider;
+  readonly media: MediaStore;
   start(): Promise<void>;
   stop(): Promise<void>;
   health(): Promise<WakuDmGatewayHealth>;
+  /** 中途发图/发卡：与 Agent 的 final 走同一条 outbox → adapter.send 的路。 */
+  reply(input: DmReplyInput): Promise<DmReplyResult>;
 }
 
 export interface BuildDmOptions {
@@ -394,6 +448,35 @@ export function buildWakuDmGateway(options: BuildDmOptions): WakuDmGateway {
     isAdminPrincipal: isOwner,
   });
 
+  const media = createMediaStore({
+    rootDir: config.mediaDir,
+    log,
+    ...(options.fetchImpl === undefined ? {} : { fetchImpl: options.fetchImpl }),
+    now,
+    limits: {
+      imageMaxBytes: config.mediaImageMaxBytes,
+      mediaMaxBytes: config.mediaMaxBytes,
+      timeoutMs: config.mediaTimeoutMs,
+      ttlMs: config.mediaTtlMs,
+      sweepIntervalMs: config.mediaSweepIntervalMs,
+    },
+  });
+
+  const attachments = {
+    probe: createMediaProbe({ log }),
+    // 上传缓存活在 SQLite：重启也不会让一个已经传上去的视频再传一次。
+    cache: {
+      get: (key: string) => store.getAssetUpload(key, now(), ASSET_CACHE_TTL_MS),
+      set: (key: string, assetId: string) => {
+        store.transaction((tx) => tx.saveAssetUpload(key, assetId, now()));
+      },
+    },
+    tmpDir: path.join(config.stateDir, 'outbound'),
+    transcodeVideo: config.videoTranscode,
+    maxVideoSeconds: config.maxVideoSeconds,
+    maxUploadBytes: config.maxUploadBytes,
+  };
+
   const adapter = createWakuDmAdapter({
     instanceId: config.instanceId,
     apiBase: config.apiBase,
@@ -402,6 +485,8 @@ export function buildWakuDmGateway(options: BuildDmOptions): WakuDmGateway {
     store,
     now,
     log,
+    media,
+    attachments,
     ...(options.fetchImpl === undefined ? {} : { fetchImpl: options.fetchImpl }),
     heartbeat: {
       // 心跳是 bridge 身份专属（session 模式的真账号打 /agent-bridges/me/* 会 403）。
@@ -437,10 +522,12 @@ export function buildWakuDmGateway(options: BuildDmOptions): WakuDmGateway {
     ingress,
     adapter,
     credentials,
+    media,
 
     async start(): Promise<void> {
       // 崩溃遗留的 running turn 先结账，再开始收新消息。
       orchestrator.recover();
+      media.start();
       await delivery.flushPending();
       await adapter.start((envelope) => ingress.sink(envelope));
 
@@ -459,8 +546,59 @@ export function buildWakuDmGateway(options: BuildDmOptions): WakuDmGateway {
       await orchestrator.drain();
       await delivery.flushPending().catch(() => undefined);
       await adapter.stop();
+      media.stop();
       await agent.shutdown().catch(() => undefined);
       store.close();
+    },
+
+    async reply(input: DmReplyInput): Promise<DmReplyResult> {
+      const parsed = parseAttachmentMarkers(input.text ?? '');
+      const merged = mergeAttachments([], [...parsed.attachments, ...(input.attachments ?? [])]);
+
+      // 会话推断：**只认"当前正在跑的 turn"**，不猜文件 mtime。
+      // mtime 式的"最近活跃会话"在两个人同时聊天时会把 A 的图发给 B——宁可让调用方多打一个参数。
+      let conversationId = input.conversationId ?? null;
+      if (conversationId === null) {
+        const running = [...new Set(orchestrator.runningTurns().map((turn) => turn.conversationId))];
+        if (running.length === 1) conversationId = running[0];
+        else if (running.length === 0) {
+          throw configError('no turn is running right now: pass --conversation <conversation_id> (it is in the prompt prefix)');
+        } else {
+          throw configError(`${running.length} turns are running: pass --conversation <conversation_id> to say which one`);
+        }
+      }
+
+      const conversation = store.getConversation(conversationId);
+      const running = orchestrator.runningTurns().find((turn) => turn.conversationId === conversationId) ?? null;
+      const pairingId = conversation?.pairingId ?? running?.pairingId ?? null;
+      if (pairingId === null) {
+        throw configError(`unknown conversation ${conversationId}: nobody has talked in it on this daemon yet`);
+      }
+      if (parsed.text.length === 0 && merged.length === 0) {
+        throw configError('nothing to send: give --text and/or one of --image/--video/--audio/--card');
+      }
+
+      const result = await delivery.publish({
+        pairingId,
+        routeId: conversationId,
+        keyVersion: running?.keyVersion ?? 1,
+        kind: 'final',
+        // 与 Agent 的 final 同一条路：先落 outbox 再发，失败按同一套回执重投。
+        messageId: `reply:${randomUUID()}`,
+        payload: {
+          type: 'final',
+          conversationId,
+          replyTo: 'loopback',
+          text: parsed.text,
+          ...(merged.length === 0 ? {} : { attachments: merged }),
+        },
+      });
+      return {
+        conversationId,
+        messageId: result.messageId,
+        status: result.receipt.status,
+        attachments: merged.length,
+      };
     },
 
     async health(): Promise<WakuDmGatewayHealth> {

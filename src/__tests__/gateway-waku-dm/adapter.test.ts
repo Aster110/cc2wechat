@@ -163,17 +163,27 @@ describe('waku-dm · 入站映射与过滤', () => {
     expect(f.envelopes).toHaveLength(1);
   });
 
-  it('非文字消息（image 等）→ 回一句「暂时只支持文字」，每会话 60s 最多一次，且不进 sink', async () => {
+  it('还看不了的 kind（sticker 等）→ 回一句提示，每会话 60s 最多一次，且不进 sink', async () => {
     const adapter = makeAdapter();
     await started(adapter);
-    f.server.emitChatMessage({ conversationId: CONV, senderUserId: OWNER, kind: 'image', body: null });
+    f.server.emitChatMessage({ conversationId: CONV, senderUserId: OWNER, kind: 'sticker', body: null });
     f.server.emitChatMessage({ conversationId: CONV, senderUserId: OWNER, kind: 'sticker', body: null });
     await waitFor(() => f.server.messages.length === 1, { label: 'one notice' });
     expect(f.server.messages[0]).toMatchObject({ conversationId: CONV, senderUserId: PERSONA });
-    expect(f.server.messages[0].body).toContain('只支持文字');
+    expect(f.server.messages[0].body).toContain('还看不了');
     await sleep(80);
     expect(f.server.messages).toHaveLength(1);
     expect(f.envelopes).toHaveLength(0);
+  });
+
+  it('图片没接下载器时不再一刀切拒收：进 sink，正文留一个无路径的 [Image] 标记', async () => {
+    const adapter = makeAdapter();
+    await started(adapter);
+    f.server.emitChatMessage({ conversationId: CONV, senderUserId: OWNER, kind: 'image', body: '看这个' });
+    await waitFor(() => f.envelopes.length === 1, { label: 'image reaches the sink' });
+    expect(f.envelopes[0].text).toBe('看这个\n[Image]');
+    expect(f.envelopes[0].mediaPaths).toEqual([]);
+    expect(f.server.messages).toHaveLength(0);
   });
 
   it('其它事件（chat.read / activity.*）不进 sink，但游标照推', async () => {

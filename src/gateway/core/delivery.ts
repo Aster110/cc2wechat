@@ -39,6 +39,11 @@ export interface PublishInput {
   keyVersion: number;
   kind: MailboxKind;
   payload: SecurePayload;
+  /**
+   * 由调用方指定 outbox id（回环回复口用 `reply:<uuid>`，让人一眼看出这条不是某一轮的产物）。
+   * 缺省仍由 Core 铸 UUIDv7。**一旦铸出就不许换**——重投复用同一个 id 是幂等的全部依据。
+   */
+  messageId?: string;
 }
 
 export interface PublishResult {
@@ -107,7 +112,7 @@ export function createCoreDelivery(options: CoreDeliveryOptions): CoreDelivery {
 
   return {
     async publish(input: PublishInput): Promise<PublishResult> {
-      const messageId = options.newMessageId();
+      const messageId = input.messageId ?? options.newMessageId();
       const createdAt = now();
 
       // 先落库：这一步返回后，即使下一行崩了，重启也还能把它投出去。

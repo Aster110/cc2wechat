@@ -78,6 +78,7 @@ import {
   type GatewayOrchestrator,
 } from '../core/orchestrator.js';
 import { createCoreIngress, type CoreIngress } from '../core/ingress.js';
+import { DEFAULT_DM_HEALTH_PORT } from '../dm-paths.js';
 
 // ---------------------------------------------------------------------------
 // 配置
@@ -121,8 +122,8 @@ export interface GatewayConfig {
 }
 
 export const DEFAULT_HEALTH_PORT = 18091;
-/** waku-dm 通道的缺省运维端口：与 V1 信箱 daemon 可以同机并跑。 */
-export const DEFAULT_DM_HEALTH_PORT = 18092;
+/** waku-dm 通道的缺省运维端口：与 V1 信箱 daemon 可以同机并跑。唯一定义在 `../dm-paths.js`。 */
+export { DEFAULT_DM_HEALTH_PORT };
 export const DEFAULT_FLUSH_INTERVAL_MS = 30_000;
 export const DEFAULT_GRANT_TTL_MS = 10 * 60 * 1000;
 

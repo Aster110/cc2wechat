@@ -175,6 +175,7 @@ export interface GatewayTransaction {
   updateReceiptStatus(pairingId: string, messageId: string, status: ReceiptStatus): void;
   commitCursor(collection: string, cursor: CursorRow): void;
 
+  saveAssetUpload(cacheKey: string, assetId: string, createdAt: number): void;
   insertOutbox(record: NewOutbox): 'inserted' | 'duplicate';
   markOutboxSent(messageId: string, externalDeliveryId: string, sentAt: number): void;
   /** 玩家自己说收到了：不再重投，也别伪造一个 externalDeliveryId。 */
@@ -209,6 +210,8 @@ export interface GatewayStore {
   getPairingSecret(id: string): Uint8Array | null;
   getReceipt(pairingId: string, messageId: string): ReceiptRow | null;
   getCursor(collection: string): CursorRow | null;
+  /** 上传缓存：`maxAgeMs` 之外的行当作不存在（不删，下次覆盖）。 */
+  getAssetUpload(cacheKey: string, now: number, maxAgeMs: number): string | null;
   getOutbox(messageId: string): OutboxRow | null;
   listPendingOutbox(): OutboxRow[];
   getConversation(id: string): ConversationRow | null;
@@ -318,6 +321,16 @@ const MIGRATIONS: ReadonlyArray<{ version: number; sql: string }> = [
         created_at INTEGER NOT NULL,
         sent_at INTEGER,
         external_delivery_id TEXT
+      );
+
+      -- 出站附件的上传结果缓存。存在的唯一理由：**重投不要重复上传**。
+      -- 上传成功但 sendMessage 失败时，outbox 行会被原样重投；没有这张表的话，
+      -- 一个 80 MB 的视频会被重新传一遍（用户流量 + 平台配额都白烧）。
+      -- key = 路径 + 大小 + mtime：同一个文件没动过就复用同一枚 asset。
+      CREATE TABLE IF NOT EXISTS asset_uploads (
+        cache_key TEXT PRIMARY KEY,
+        asset_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS conversations (
@@ -711,6 +724,16 @@ export function openGatewayStore(options: OpenGatewayStoreOptions): GatewayStore
       ).run(collection, cursor.lastCreatedAt, cursor.lastMessageId);
     },
 
+    saveAssetUpload(cacheKey: string, assetId: string, createdAt: number): void {
+      prep(
+        `INSERT INTO asset_uploads (cache_key, asset_id, created_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(cache_key) DO UPDATE SET
+           asset_id = excluded.asset_id,
+           created_at = excluded.created_at`,
+      ).run(cacheKey, assetId, createdAt);
+    },
+
     insertOutbox(record: NewOutbox): 'inserted' | 'duplicate' {
       const result = prep(
         `INSERT INTO outbox_records
@@ -905,6 +928,13 @@ export function openGatewayStore(options: OpenGatewayStoreOptions): GatewayStore
         lastCreatedAt: num(row, 'last_created_at'),
         lastMessageId: text(row, 'last_message_id'),
       };
+    },
+
+    getAssetUpload(cacheKey: string, now: number, maxAgeMs: number): string | null {
+      const row = one('SELECT * FROM asset_uploads WHERE cache_key = ?', cacheKey);
+      if (row === null) return null;
+      if (now - num(row, 'created_at') > maxAgeMs) return null;
+      return text(row, 'asset_id');
     },
 
     getOutbox(messageId: string): OutboxRow | null {

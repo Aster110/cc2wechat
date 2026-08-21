@@ -73,6 +73,12 @@ export interface DmInboundEnvelope {
   messageId: string;
   principalRef: string;
   text: string;
+  /**
+   * 已经落到本机磁盘的媒体绝对路径（图片 / 视频 / 语音）。通道下载，Core 只搬运，
+   * Runner 交给 Agent（codex 的 `localImage` / `localAudio` 就吃这个）。
+   * 下载失败时这里是空数组，正文里仍留一个无路径的 `[Image]` 标记——不丢整条消息。
+   */
+  mediaPaths?: string[];
   createdAt: number;
   receivedAt: number;
 }
@@ -169,6 +175,14 @@ function classifyOpenError(error: unknown): OpenFailure {
   }
   const code = isGatewayError(error) ? error.code : 'chunk_auth_failed';
   return openFailure(code, 'failed to open the inbound message', code !== 'key_version_mismatch');
+}
+
+/**
+ * 交给 Agent 的正文前缀。带上 conversation_id 是为了让 Agent 能自己回环发图/发卡
+ * （`waku-dm-reply --conversation <id>`），不必靠 daemon 猜"当前是哪条会话"。
+ */
+export function dmPromptPrefix(conversationId: string): string {
+  return `[Waku私聊 conv=${conversationId}] `;
 }
 
 function rejected(code: string): IngressAck {
@@ -470,9 +484,12 @@ export function createCoreIngress(options: CoreIngressOptions): CoreIngress {
       conversationId: envelope.routeId,
       generation: decision.conversation.generation,
       messageId: envelope.messageId,
-      text: envelope.text,
+      // 前缀让 Agent 知道自己在哪条 Waku 私聊里（回环 CLI 的 --conversation 要用它），
+      // 类比微信通道的 `[微信]`。它只进 Agent 的输入，不进任何出站文案。
+      text: `${dmPromptPrefix(envelope.routeId)}${envelope.text}`,
       clientSeq: 0,
       receivedAt: envelope.receivedAt,
+      mediaPaths: envelope.mediaPaths ?? [],
     };
 
     const result = await dispatcher.submitTurn(job);

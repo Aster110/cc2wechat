@@ -20,7 +20,8 @@ const HELP_TEXT = [
   '/exit - 关闭会话（退出 / 结束）',
   '/help - 显示帮助',
   '',
-  '直接发文字即可与 Codex 对话；图片/语音暂不支持。',
+  '直接发文字、图片、视频、语音或 playable 卡片即可与 Codex 对话；',
+  '它也能回图、回视频、回语音，以及把做好的 playable 作为卡片发给你。',
 ].join('\n');
 
 export const DM_REPLY = {

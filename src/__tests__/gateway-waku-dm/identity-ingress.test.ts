@@ -18,7 +18,7 @@ import type { DmInboundEnvelope, InboundEnvelope, IngressDelivery, PairingSeam }
 import type { ControlCommand, SubmitResult, ControlResult, TurnDispatcher, TurnJob, TurnTiming } from '../../gateway/core/orchestrator.js';
 import type { SecurePayload, MailboxKind } from '../../gateway/contracts/envelope.js';
 
-import { createCoreIngress } from '../../gateway/core/ingress.js';
+import { createCoreIngress, dmPromptPrefix } from '../../gateway/core/ingress.js';
 import { createAclIdentityResolver, createPairingIdentityResolver } from '../../gateway/core/identity.js';
 import { createConversationService } from '../../gateway/core/conversation-service.js';
 import { createGatewayOrchestrator } from '../../gateway/core/orchestrator.js';
@@ -260,8 +260,10 @@ describe('waku-dm · ingress 明文入站', () => {
       conversationId: CONV,
       generation: 1,
       messageId: 'cmsg_1',
-      text: '跑一下测试',
+      // 交给 Agent 的正文带会话前缀：它要靠这个 id 才能用回环 CLI 中途发图/发卡。
+      text: `${dmPromptPrefix(CONV)}跑一下测试`,
       clientSeq: 0,
+      mediaPaths: [],
     });
     expect(f.store.getReceipt(OWNER, 'cmsg_1')?.status).toBe('received');
     // waku-dm 没有 Playable 那种 ack(received) 信箱回执：不往 outbox 里塞空行
