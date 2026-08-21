@@ -51,7 +51,10 @@ export interface BindProviderInput {
 export interface ConversationService {
   /** turn / resume 走这里：不存在就创建，存在就校验 owner 与 generation。 */
   open(input: ConversationRef): ConversationDecision;
-  /** `new` 控制走这里：conversationId 必须是新的，可选地 supersede 上一条会话。 */
+  /**
+   * `new` 控制走这里：conversationId 必须是新的，可选地 supersede 上一条会话。
+   * 特例：`previousConversationId === conversationId` = 同会话提代（generation+1，不新建行）。
+   */
   startNew(input: ConversationRef & { previousConversationId?: string }): ConversationDecision;
   /** 只判归属，不动 generation（stop / resume 的前置检查）。 */
   authorize(input: Omit<ConversationRef, 'generation'>): ConversationDecision;
@@ -148,6 +151,26 @@ export function createConversationService(
       // supersede 旧会话与创建新会话必须同生共死：中途失败会留下
       // 「旧会话已断代、新会话没建起来」的黑洞，客户端两头都接不上。
       return store.transaction((tx): ConversationDecision => {
+        // previousConversationId === conversationId = 「同会话提代」（waku-dm 的 /new：Waku 会话 id 不变，
+        // 只把代数 +1 让旧 binding 失效、在途旧代消息变 stale）。V1 客户端从不发这种形状——
+        // 它们 new 时总是铸一个新 id，所以原有「重开已有会话被拒」的语义原样保留在下面。
+        if (input.previousConversationId === input.conversationId) {
+          const existing = store.getConversation(input.conversationId);
+          if (existing !== null) {
+            if (!ownedBy(existing, input)) {
+              return deny('conversation_forbidden', FORBIDDEN_MESSAGE);
+            }
+            const generation = tx.bumpGeneration(existing.id);
+            return {
+              allowed: true,
+              conversation: { ...snapshotOf(existing), generation },
+              created: false,
+              generationChanged: true,
+            };
+          }
+          // 还没有会话：落到下面的首次创建路径。
+        }
+
         if (store.getConversation(input.conversationId) !== null) {
           return deny('conversation_exists', 'conversation already exists');
         }

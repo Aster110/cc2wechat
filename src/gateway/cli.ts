@@ -11,7 +11,7 @@
  * 轮询集合。CLI 自己签一张，daemon 那头根本不会去听那条路由 ——
  * 玩家扫了码，等到的是永远的静默。
  */
-import { loadGatewayConfig, type GatewayConfig, type IssuedGrant } from './bootstrap/waku.js';
+import { loadGatewayConfig, loadOpsEndpoint, type IssuedGrant } from './bootstrap/waku.js';
 
 interface CliOptions {
   endpointId?: string;
@@ -42,21 +42,26 @@ function parseArgs(argv: readonly string[]): CliOptions {
   return options;
 }
 
-function baseUrl(config: GatewayConfig): string {
-  return `http://${config.healthHost}:${config.healthPort}`;
+interface OpsEndpoint {
+  host: string;
+  port: number;
 }
 
-async function call(config: GatewayConfig, path: string, method: 'GET' | 'POST', body?: unknown): Promise<unknown> {
+function baseUrl(endpoint: OpsEndpoint): string {
+  return `http://${endpoint.host}:${endpoint.port}`;
+}
+
+async function call(endpoint: OpsEndpoint, path: string, method: 'GET' | 'POST', body?: unknown): Promise<unknown> {
   let response: Response;
   try {
-    response = await fetch(`${baseUrl(config)}${path}`, {
+    response = await fetch(`${baseUrl(endpoint)}${path}`, {
       method,
       headers: { 'Content-Type': 'application/json' },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
   } catch {
     throw new Error(
-      `cannot reach the gateway daemon at ${baseUrl(config)} — is it running? ` +
+      `cannot reach the gateway daemon at ${baseUrl(endpoint)} — is it running? ` +
         '(start it with `node dist/gateway/server.js`)',
     );
   }
@@ -96,11 +101,12 @@ function printGrant(grant: IssuedGrant): void {
 const USAGE = `用法：node dist/gateway/cli.js <command>
 
   pair-grant [--endpoint <id>] [--scopes a,b] [--ttl-ms <n>]
-             签发一次性配对码并登记到正在跑的 daemon（打印一次）
-  health     打印 daemon 健康快照
+             签发一次性配对码并登记到正在跑的 daemon（打印一次；仅 waku-mailbox 通道）
+  health     打印 daemon 健康快照（waku-mailbox / waku-dm 都可用）
 
-配置走 WAKU_GATEWAY_* 环境变量（至少要有 WAKU_GATEWAY_RUNTIME_JS，
-CLI 只用其中的 HEALTH_PORT 找到 daemon）。
+配置走 WAKU_GATEWAY_* 环境变量：health 只看 WAKU_GATEWAY_CHANNEL（决定缺省端口：
+waku-mailbox=18091、waku-dm=18092）与 WAKU_GATEWAY_HEALTH_PORT；pair-grant 需要 V1 全量配置
+（至少 WAKU_GATEWAY_RUNTIME_JS）。
 `;
 
 async function main(): Promise<void> {
@@ -110,17 +116,18 @@ async function main(): Promise<void> {
     return;
   }
 
-  const config = loadGatewayConfig(process.env);
-
   if (command === 'pair-grant') {
+    // 配对码是 V1 信箱通道的概念：要全量 V1 配置（它会在缺 RUNTIME_JS 时说人话）。
+    const config = loadGatewayConfig(process.env);
     const options = parseArgs(rest);
-    const grant = (await call(config, '/admin/pair-grant', 'POST', options)) as IssuedGrant;
+    const grant = (await call({ host: config.healthHost, port: config.healthPort }, '/admin/pair-grant', 'POST', options)) as IssuedGrant;
     printGrant(grant);
     return;
   }
 
   if (command === 'health') {
-    const health = await call(config, '/health', 'GET');
+    // health 对两种通道都能用：只需要知道 daemon 在哪个回环端口听。
+    const health = await call(loadOpsEndpoint(process.env), '/health', 'GET');
     process.stdout.write(`${JSON.stringify(health, null, 2)}\n`);
     return;
   }

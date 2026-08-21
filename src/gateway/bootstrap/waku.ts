@@ -121,17 +121,19 @@ export interface GatewayConfig {
 }
 
 export const DEFAULT_HEALTH_PORT = 18091;
+/** waku-dm 通道的缺省运维端口：与 V1 信箱 daemon 可以同机并跑。 */
+export const DEFAULT_DM_HEALTH_PORT = 18092;
 export const DEFAULT_FLUSH_INTERVAL_MS = 30_000;
 export const DEFAULT_GRANT_TTL_MS = 10 * 60 * 1000;
 
-function readEnv(env: NodeJS.ProcessEnv, key: string): string | null {
+export function readEnv(env: NodeJS.ProcessEnv, key: string): string | null {
   const raw = env[`${ENV_PREFIX}${key}`];
   if (raw === undefined) return null;
   const trimmed = raw.trim();
   return trimmed.length === 0 ? null : trimmed;
 }
 
-function readInt(env: NodeJS.ProcessEnv, key: string, fallback: number): number {
+export function readInt(env: NodeJS.ProcessEnv, key: string, fallback: number): number {
   const raw = readEnv(env, key);
   if (raw === null) return fallback;
   const parsed = Number.parseInt(raw, 10);
@@ -141,7 +143,7 @@ function readInt(env: NodeJS.ProcessEnv, key: string, fallback: number): number 
   return parsed;
 }
 
-function readList(env: NodeJS.ProcessEnv, key: string): string[] {
+export function readList(env: NodeJS.ProcessEnv, key: string): string[] {
   const raw = readEnv(env, key);
   if (raw === null) return [];
   return raw
@@ -155,7 +157,7 @@ export function configError(message: string): Error & { code: string } {
 }
 
 /** `policy=/path,other=/path2`。留空则用 WORKSPACE_DIR 兜底给主 policy。 */
-function parseWorkspaces(
+export function parseWorkspaces(
   env: NodeJS.ProcessEnv,
   policyId: string,
 ): Record<string, string> {
@@ -409,6 +411,46 @@ function createMint(config: GatewayConfig): () => Promise<void> {
   };
 }
 
+/**
+ * 运维 CLI 只需要知道 daemon 在哪听：按通道给缺省端口，不要求 V1 的 RUNTIME_JS 等全量配置。
+ */
+export function loadOpsEndpoint(env: NodeJS.ProcessEnv = process.env): { host: string; port: number } {
+  const channel = readEnv(env, 'CHANNEL') ?? 'waku-mailbox';
+  const fallback = channel === 'waku-dm' ? DEFAULT_DM_HEALTH_PORT : DEFAULT_HEALTH_PORT;
+  return { host: '127.0.0.1', port: readInt(env, 'HEALTH_PORT', fallback) };
+}
+
+export interface GatewayAgentOptions {
+  /** `codex`（缺省，常驻 app-server）| `claude-sdk` / `claude`。 */
+  backend: string | null;
+  codexHome: string | null;
+  codexEffort: string | null;
+  /** 健康检查端口：只用来给 app-server 的 pid 文件命名。 */
+  port: number;
+  /** 给定则 pid 文件落这里（waku-dm 放进自己的 state dir，不碰 ~/.cc2wechat）。 */
+  pidFilePath?: string;
+  env?: NodeJS.ProcessEnv;
+}
+
+/**
+ * Agent 后端可切（WAKU_GATEWAY_AGENT_BACKEND=codex|claude-sdk，缺省 codex）。
+ * 节点上没有 codex 二进制/登录态时（如 air2），用 claude-sdk 走本机 Claude Code 登录态。
+ */
+export function createGatewayAgent(options: GatewayAgentOptions): AgentAdapter {
+  const backend = (options.backend ?? 'codex').trim().toLowerCase();
+  if (backend === 'claude-sdk' || backend === 'claude') return new ClaudeSdkAgent();
+  const baseEnv = options.env ?? process.env;
+  return new CodexAppServerAgent({
+    env: {
+      ...baseEnv,
+      ...(options.codexHome === null ? {} : { CODEX_HOME: options.codexHome }),
+      ...(options.codexEffort === null ? {} : { CC2WECHAT_CODEX_EFFORT: options.codexEffort }),
+    },
+    port: options.port,
+    ...(options.pidFilePath === undefined ? {} : { pidFilePath: options.pidFilePath }),
+  });
+}
+
 // ---------------------------------------------------------------------------
 // 组装
 // ---------------------------------------------------------------------------
@@ -503,21 +545,14 @@ export function buildWakuGateway(options: BuildOptions): WakuGateway {
 
   const conversations = createConversationService({ store, now });
 
-  // Agent 后端可切（WAKU_GATEWAY_AGENT_BACKEND=codex|claude-sdk，缺省 codex）。
-  // 节点上没有 codex 二进制/登录态时（如 air2），用 claude-sdk 走本机 Claude Code 登录态。
-  const backend = (process.env['WAKU_GATEWAY_AGENT_BACKEND'] ?? 'codex').trim().toLowerCase();
   const agent =
     options.agent ??
-    (backend === 'claude-sdk' || backend === 'claude'
-      ? new ClaudeSdkAgent()
-      : new CodexAppServerAgent({
-          env: {
-            ...process.env,
-            ...(config.codexHome === null ? {} : { CODEX_HOME: config.codexHome }),
-            ...(config.codexEffort === null ? {} : { CC2WECHAT_CODEX_EFFORT: config.codexEffort }),
-          },
-          port: config.healthPort,
-        }));
+    createGatewayAgent({
+      backend: process.env['WAKU_GATEWAY_AGENT_BACKEND'] ?? null,
+      codexHome: config.codexHome,
+      codexEffort: config.codexEffort,
+      port: config.healthPort,
+    });
 
   const runner = createLocalRunnerAdapter({
     runnerId: config.endpoint.runnerProfileId,

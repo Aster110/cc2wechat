@@ -237,6 +237,47 @@ The daemon automatically starts a ttyd instance for each tmux session. The URL i
   needs nothing extra
 - Falls back to SDK/Pipe delivery if neither iTerm nor tmux available
 
+## Waku DM channel (`waku-dm`)
+
+Besides WeChat, the same Core can serve a **Waku AI-friend persona**: users DM the persona inside the
+Waku app, a local daemon subscribes to the persona's event bus over SSE, hands the text to your local
+Codex, and posts the reply back into the same DM. No inbound ports, no new transport — platform JWT +
+REST + SSE. Full architecture, env table and troubleshooting: [docs/waku-dm-channel.md](docs/waku-dm-channel.md).
+
+```bash
+npm run build
+export WAKU_GATEWAY_CHANNEL=waku-dm
+export WAKU_GATEWAY_API_BASE=https://waku-core-api-yyvdcgnhha-uc.a.run.app/api/v1
+export WAKU_GATEWAY_BRIDGE_CREDENTIAL_FILE=$HOME/.waku-gateway-dm/bridge.credential   # 0600, from `waku agent-friend credential issue <bridge_id> --write <path>`
+export WAKU_GATEWAY_OWNER_USER_IDS=usr_8c8b6c0329f140cd8dc78dfcff7ddeec           # who may talk to the agent
+export WAKU_GATEWAY_STATE_DIR=$HOME/.waku-gateway-dm
+export WAKU_GATEWAY_HEALTH_PORT=18092
+export WAKU_GATEWAY_WORKSPACE_DIR=$HOME/my-project
+export WAKU_GATEWAY_AGENT_BACKEND=codex
+export WAKU_GATEWAY_CODEX_HOME=$HOME/.codex
+node dist/gateway/server.js
+```
+
+| Variable | Effect | Default |
+|----------|--------|---------|
+| `WAKU_GATEWAY_CHANNEL` | `waku-dm`; unset keeps the V1 `waku-mailbox` daemon | `waku-mailbox` |
+| `WAKU_GATEWAY_API_BASE` | Waku Core v1 base URL | from auth.json in session mode |
+| `WAKU_GATEWAY_BRIDGE_CREDENTIAL_FILE` | 0600 file holding the `abc_…` bridge credential (recommended) | — |
+| `WAKU_GATEWAY_AUTH_PATH` | Alternative session mode: a logged-in `waku` auth.json (mutually exclusive with the credential file) | — |
+| `WAKU_GATEWAY_OWNER_USER_IDS` | Comma-separated Waku user ids mapped to the `admin-bypass` endpoint | required |
+| `WAKU_GATEWAY_DEFAULT_TIER` | Tier for everyone else: `deny` (silent) or `chat-only`/`sandbox-workspace`/`repo-pr` (needs `WAKU_GATEWAY_GUEST_WORKSPACE_DIR`) | `deny` |
+| `WAKU_GATEWAY_STATE_DIR` / `HEALTH_PORT` | Own SQLite + loopback ops port (can run next to the V1 daemon) | `~/.waku-gateway-dm` / `18092` |
+| `WAKU_GATEWAY_HEARTBEAT_INTERVAL_MS` / `SSE_IDLE_TIMEOUT_MS` / `COLD_START_GRACE_MS` | Heartbeat cadence, SSE dead-connection threshold, how old a cold-start replay may be | `30000` / `30000` / `60000` |
+| `CC2WECHAT_ACK_MS` | Slow-turn notice (“收到，正在处理…”); `0` disables | `60000` |
+| `WAKU_GATEWAY_WORKSPACE_DIR` / `AGENT_BACKEND` / `CODEX_HOME` / `CODEX_EFFORT` / `NODE_ID` / `ENDPOINT_ID` / `TRUST_TIER` | Same as the V1 gateway | same |
+
+Commands inside the DM: `/new` (fresh context, same conversation), `/stop`, `/exit`, `/help`.
+
+Health: `node dist/gateway/cli.js health` (with `WAKU_GATEWAY_CHANNEL=waku-dm`) or `curl 127.0.0.1:18092/health` —
+`channel: {type, state, cursor, lastEventAt, lastHeartbeatAt, reconnects, tokenState, selfUserId}` plus the V1 `core/runner/endpoints/queues/outbox` blocks.
+Read-only transport smoke against the real backend: `node dist/gateway/server.js --sse-smoke 15` (prints event names and seqs only).
+Golden path: `PERSONA_USER_ID=<id> node scripts/golden-e2e-dm.mjs`.
+
 ## License
 
 MIT

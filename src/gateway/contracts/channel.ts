@@ -14,7 +14,8 @@ import {
   rejectUnknownKeys,
 } from './validation.js';
 
-export const CHANNEL_TYPES = ['waku'] as const;
+/** `waku` = V1 加密信箱（Playable）；`waku-dm` = 马甲私聊（平台鉴权，明文）。 */
+export const CHANNEL_TYPES = ['waku', 'waku-dm'] as const;
 export type ChannelType = (typeof CHANNEL_TYPES)[number];
 
 export const CHANNEL_PROTOCOL_VERSION = 1;
