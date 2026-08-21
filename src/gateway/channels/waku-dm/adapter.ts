@@ -31,8 +31,10 @@ import type { DmInboundEnvelope, InboundEnvelope } from '../../core/ingress.js';
 import type { GatewayLogger } from '../../log.js';
 import type { GatewayStore } from '../../state/sqlite-store.js';
 import { splitText, stripMarkdown } from '../../../v5/sender/replier.js';
+import { createAttachmentSender, type AttachmentSenderConfig } from './attachment-sender.js';
 import { isWakuApiError, type WakuChatClient } from './chat-client.js';
 import type { BridgeTokenProvider } from './credential-provider.js';
+import type { MediaStore } from './media-store.js';
 import { createSseSubscription, type SseFrame, type SseSubscription } from './sse-client.js';
 
 // ---------------------------------------------------------------------------
@@ -51,7 +53,7 @@ const CLIENT_MSG_ID_MAX = 128;
 const SHUTDOWN_HEARTBEAT_TIMEOUT_MS = 2_000;
 
 export const DM_SLOW_ACK_TEXT = '收到，正在处理…';
-export const DM_UNSUPPORTED_KIND_TEXT = '暂时只支持文字消息，发文字给我吧 🙏';
+export const DM_UNSUPPORTED_KIND_TEXT = '这类消息我还看不了，发文字 / 图片 / 视频 / 语音 / playable 卡片给我吧 🙏';
 
 // ---------------------------------------------------------------------------
 // 注入接缝
@@ -83,6 +85,10 @@ export interface WakuDmAdapterOptions {
   fetchImpl?: typeof fetch;
   timer?: TimerSeam;
   heartbeat: WakuDmHeartbeatConfig;
+  /** 入站媒体落盘。不给 = 不下载（只留无路径标记），单测里可以省掉它。 */
+  media?: MediaStore;
+  /** 出站附件上传与探测。不给 = 附件退化成一行文字说明。 */
+  attachments?: AttachmentSenderConfig;
   sse?: { idleTimeoutMs?: number; backoff?: { baseMs: number; maxMs: number }; reconnectDelayMs?: number };
   /** 0 = 关闭慢回执。 */
   slowAckMs?: number;
@@ -118,6 +124,41 @@ export interface WakuDmAdapter {
 // 线上消息解析（这是 adapter 唯一碰 chat.message DTO 的地方）
 // ---------------------------------------------------------------------------
 
+/** `chat.message` 帧里 `image` 字段的形状（waku-core `chat_service._resolve_image`）。 */
+export interface WireImage {
+  assetId: string | null;
+  url: string | null;
+  width: number | null;
+  height: number | null;
+}
+
+/** `payload` 字段（kind=video）。 */
+export interface WireVideo {
+  assetId: string | null;
+  url: string | null;
+  width: number | null;
+  height: number | null;
+  durationMs: number | null;
+  posterUrl: string | null;
+}
+
+/** `payload` 字段（kind=voice）。 */
+export interface WireVoice {
+  assetId: string | null;
+  url: string | null;
+  durationMs: number | null;
+}
+
+/** `card` 字段（kind=playable_card）。 */
+export interface WireCard {
+  contentId: string | null;
+  title: string | null;
+  coverUrl: string | null;
+  authorName: string | null;
+  projectId: string | null;
+  shareUrl: string | null;
+}
+
 export interface WireChatMessage {
   id: string;
   conversationId: string;
@@ -129,6 +170,14 @@ export interface WireChatMessage {
   createdAt: number | null;
   recalled: boolean;
   source: string | null;
+  /** kind=image 时非空。 */
+  image: WireImage | null;
+  /** kind=video 时非空。 */
+  video: WireVideo | null;
+  /** kind=voice 时非空。 */
+  voice: WireVoice | null;
+  /** kind=playable_card 时非空。 */
+  card: WireCard | null;
 }
 
 /**
@@ -168,6 +217,8 @@ export function parseChatMessage(data: string): WireChatMessage | null {
   if (id === null || conversationId === null || senderUserId === null || kind === null) return null;
 
   const convSeq = record['conv_seq'];
+  const image = kind === 'image' ? parseWireImage(record['image']) : null;
+  const payload = kind === 'video' || kind === 'voice' ? asWireRecord(record['payload']) : null;
   return {
     id,
     conversationId,
@@ -179,7 +230,81 @@ export function parseChatMessage(data: string): WireChatMessage | null {
     createdAt: parseWireTimestamp(record['created_at']),
     recalled: record['recalled_at'] !== null && record['recalled_at'] !== undefined,
     source: str('source'),
+    image,
+    video: kind === 'video' && payload !== null ? parseWireVideo(payload) : null,
+    voice: kind === 'voice' && payload !== null ? parseWireVoice(payload) : null,
+    card: kind === 'playable_card' ? parseWireCard(record['card']) : null,
   };
+}
+
+function asWireRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function wireString(record: Record<string, unknown>, key: string): string | null {
+  const value = record[key];
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+function wireNumber(record: Record<string, unknown>, key: string): number | null {
+  const value = record[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+export function parseWireImage(value: unknown): WireImage | null {
+  const record = asWireRecord(value);
+  if (record === null) return null;
+  return {
+    assetId: wireString(record, 'asset_id'),
+    url: wireString(record, 'url'),
+    width: wireNumber(record, 'width'),
+    height: wireNumber(record, 'height'),
+  };
+}
+
+export function parseWireVideo(record: Record<string, unknown>): WireVideo {
+  return {
+    assetId: wireString(record, 'asset_id'),
+    url: wireString(record, 'url'),
+    width: wireNumber(record, 'width'),
+    height: wireNumber(record, 'height'),
+    durationMs: wireNumber(record, 'duration_ms'),
+    posterUrl: wireString(record, 'poster_url'),
+  };
+}
+
+export function parseWireVoice(record: Record<string, unknown>): WireVoice {
+  return {
+    assetId: wireString(record, 'asset_id'),
+    url: wireString(record, 'url'),
+    durationMs: wireNumber(record, 'duration_ms'),
+  };
+}
+
+export function parseWireCard(value: unknown): WireCard | null {
+  const record = asWireRecord(value);
+  if (record === null) return null;
+  return {
+    contentId: wireString(record, 'content_id'),
+    title: wireString(record, 'title'),
+    coverUrl: wireString(record, 'cover_url'),
+    authorName: wireString(record, 'author_name'),
+    projectId: wireString(record, 'project_id'),
+    shareUrl: wireString(record, 'share_url'),
+  };
+}
+
+/**
+ * 卡片转成一行文本标记（不下载任何东西）。词汇与 `[Image: …]` 同源，Agent 认得出。
+ * 只有 content_id 是必需的：标题/链接缺了就少一段，不影响 Agent 判断「用户分享了一个 playable」。
+ */
+export function cardMarker(card: WireCard): string {
+  const parts: string[] = [];
+  if (card.title !== null) parts.push(card.title);
+  if (card.contentId !== null) parts.push(`content_id=${card.contentId}`);
+  if (card.authorName !== null) parts.push(`author=${card.authorName}`);
+  if (card.shareUrl !== null) parts.push(`share_url=${card.shareUrl}`);
+  return `[Card: ${parts.join(' ')}]`;
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +335,14 @@ function clientMsgIdFor(messageId: string, index: number, total: number): string
   return total === 1 ? `h_${digest}` : `h_${digest}:${index}`;
 }
 
+/** 附件的幂等 id：`<messageId>:att<i>`，与文本分片的 `<messageId>:<i>` 不会撞。 */
+export function attachmentClientMsgId(messageId: string, index: number): string {
+  const raw = `${messageId}:att${index}`;
+  if (raw.length <= CLIENT_MSG_ID_MAX) return raw;
+  const digest = createHash('sha256').update(messageId).digest('hex').slice(0, 32);
+  return `h_${digest}:att${index}`;
+}
+
 function oneLine(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
 }
@@ -230,6 +363,8 @@ export function createWakuDmAdapter(options: WakuDmAdapterOptions): WakuDmAdapte
   const coldStartGraceMs = options.coldStartGraceMs ?? WAKU_DM_COLD_START_GRACE_MS;
   const noticeMs = options.unsupportedKindNoticeMs ?? WAKU_DM_UNSUPPORTED_KIND_NOTICE_MS;
   const apiBase = options.apiBase.replace(/\/+$/, '');
+  const attachmentSender =
+    options.attachments === undefined ? null : createAttachmentSender(chat, options.attachments, log);
 
   const descriptor: ChannelDescriptor = {
     type: 'waku-dm',
@@ -238,7 +373,8 @@ export function createWakuDmAdapter(options: WakuDmAdapterOptions): WakuDmAdapte
     capabilities: {
       progress: false,
       presence: true,
-      attachments: false,
+      // 附件能力取决于有没有接上传/探测那套零件；没接上就别对外声称能发。
+      attachments: options.attachments !== undefined,
       maxMessageBytes: 4000 * 4,
     },
   };
@@ -340,7 +476,9 @@ export function createWakuDmAdapter(options: WakuDmAdapterOptions): WakuDmAdapte
       return;
     }
 
-    if (message.kind !== 'text') {
+    const composed = await composeInbound(message);
+    if (composed === null) {
+      // 这类消息我们连"标记"都造不出来（sticker / 未知 kind）：回一句限频提示就算处理过了。
       const last = noticeAt.get(message.conversationId) ?? 0;
       if (now() - last >= noticeMs) {
         noticeAt.set(message.conversationId, now());
@@ -350,7 +488,7 @@ export function createWakuDmAdapter(options: WakuDmAdapterOptions): WakuDmAdapte
       return;
     }
 
-    const text = message.body ?? '';
+    const { text, mediaPaths } = composed;
     if (text.trim().length === 0) {
       advanceCursor(frame, message.id);
       return;
@@ -362,6 +500,7 @@ export function createWakuDmAdapter(options: WakuDmAdapterOptions): WakuDmAdapte
       messageId: message.id,
       principalRef: message.senderUserId,
       text,
+      mediaPaths,
       createdAt: message.createdAt ?? now(),
       receivedAt: now(),
     };
@@ -378,6 +517,62 @@ export function createWakuDmAdapter(options: WakuDmAdapterOptions): WakuDmAdapte
       log.info(`   dropped ${message.id.slice(0, 16)} from ${message.senderUserId.slice(0, 8)}: ${ack.code}`);
     }
     advanceCursor(frame, message.id);
+  }
+
+  /**
+   * 一条线上消息 → 交给 Core 的正文与本机媒体路径。
+   *
+   * 三条：①正文（caption）永远在前，媒体标记跟在后面；②下载失败降级成无路径标记（`[Image]`）
+   * 而不是丢整条消息；③卡片不下载任何东西，只转成一行文本标记——它本来就没有二进制。
+   * 返回 null = 这个 kind 我们不认（sticker / 未知），交给调用方回提示。
+   */
+  async function composeInbound(message: WireChatMessage): Promise<{ text: string; mediaPaths: string[] } | null> {
+    const caption = (message.body ?? '').trim();
+    const parts: string[] = [];
+    const mediaPaths: string[] = [];
+    if (caption.length > 0) parts.push(caption);
+
+    async function fetchMedia(kind: 'image' | 'video' | 'voice', url: string | null, label: string): Promise<void> {
+      const path =
+        url === null || options.media === undefined
+          ? null
+          : await options.media.download({
+              conversationId: message.conversationId,
+              messageId: message.id,
+              index: 0,
+              url,
+              kind,
+            });
+      if (path === null) {
+        parts.push(`[${label}]`);
+        return;
+      }
+      parts.push(`[${label}: ${path}]`);
+      mediaPaths.push(path);
+    }
+
+    switch (message.kind) {
+      case 'text':
+        break;
+      case 'image':
+        await fetchMedia('image', message.image?.url ?? null, 'Image');
+        break;
+      case 'video':
+        await fetchMedia('video', message.video?.url ?? null, 'Video');
+        break;
+      case 'voice':
+        await fetchMedia('voice', message.voice?.url ?? null, 'Voice');
+        break;
+      case 'playable_card': {
+        if (message.card === null) return null;
+        parts.push(cardMarker(message.card));
+        break;
+      }
+      default:
+        return null;
+    }
+
+    return { text: parts.join('\n'), mediaPaths };
   }
 
   function dropReason(message: WireChatMessage): string | null {
@@ -491,12 +686,48 @@ export function createWakuDmAdapter(options: WakuDmAdapterOptions): WakuDmAdapte
     }
     if ('replyTo' in payload) cancelSlowAck(payload.replyTo);
 
-    const chunks = splitText(stripMarkdown(text), WAKU_DM_CHUNK_CHARS).filter((chunk) => chunk.trim().length > 0);
-    if (chunks.length === 0) return { status: 'sent' };
-
     const conversationId = envelope.routeId;
     const context = `conv=${conversationId.slice(0, 12)} msg=${envelope.messageId.slice(0, 8)}`;
     let firstId: string | undefined;
+
+    // 附件先走：用户先看到图/视频/卡片，再看到围绕它的那段话，读起来才顺。
+    const attachments = payload.type === 'final' && payload.attachments !== undefined ? payload.attachments : [];
+    const notices: string[] = [];
+    for (let index = 0; index < attachments.length; index += 1) {
+      const attachment = attachments[index];
+      if (attachmentSender === null) {
+        notices.push(`（附件没发出去：这台 daemon 没启用附件通道）${attachment.path ?? attachment.contentId ?? ''}`);
+        continue;
+      }
+      const outcome = await attachmentSender.send({
+        conversationId,
+        // 重投用同一个 id：服务端 UNIQUE(sender, client_msg_id) ⇒ 屏幕上不会出现第二张图。
+        clientMsgId: attachmentClientMsgId(envelope.messageId, index),
+        attachment,
+      });
+      if (outcome.status === 'sent') {
+        if (firstId === undefined && outcome.messageId.length > 0) firstId = outcome.messageId;
+        continue;
+      }
+      if (outcome.status === 'skipped') {
+        notices.push(outcome.notice);
+        continue;
+      }
+      log.error(`send failed ${context} attachment=${index + 1}/${attachments.length} (${attachment.kind}): ${outcome.code}`);
+      if (outcome.kind === 'unknown') return { status: 'unknown', code: outcome.code };
+      if (outcome.kind === 'permanent-failure') return { status: 'permanent-failure', code: outcome.code };
+      return outcome.retryAfterMs === undefined
+        ? { status: 'retryable', code: outcome.code }
+        : { status: 'retryable', code: outcome.code, retryAfterMs: outcome.retryAfterMs };
+    }
+
+    const body = notices.length === 0 ? text : [text, ...notices].filter((part) => part.trim().length > 0).join('\n');
+    const chunks = splitText(stripMarkdown(body), WAKU_DM_CHUNK_CHARS).filter((chunk) => chunk.trim().length > 0);
+    if (chunks.length === 0) {
+      if (payload.type === 'final') void markReadQuietly(conversationId);
+      return firstId === undefined ? { status: 'sent' } : { status: 'sent', externalDeliveryId: firstId };
+    }
+
     for (let index = 0; index < chunks.length; index += 1) {
       try {
         const result = await chat.sendMessage(conversationId, {

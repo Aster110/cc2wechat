@@ -10,6 +10,7 @@
  * - `createdAt >= expiresAt` 是签发方的结构错误
  * - 未来时间戳只容忍 `MAX_CLOCK_SKEW_MS` 这个常量窗口，调用方拿不到旋钮
  */
+import type { OutboundAttachment } from '../core/attachments.js';
 import {
   asRecord,
   gatewayError,
@@ -105,7 +106,17 @@ export type PairingSecurePayload =
 /** daemon 发出去的四类消息。Core 只封这些，永远不封 turn/control。 */
 export type OutboundSecurePayload =
   | { type: 'progress'; conversationId: string; replyTo: string; stage: ProgressStage; text?: string }
-  | { type: 'final'; conversationId: string; replyTo: string; text: string }
+  | {
+      type: 'final';
+      conversationId: string;
+      replyTo: string;
+      text: string;
+      /**
+       * 附件清单（Core 解析 Agent 的 `[[send-…]]` 标记 + `mediaFiles` 得到，见 core/attachments.ts）。
+       * 可选：不支持附件的通道（V1 加密信箱）看不到这个字段就当没有，行为与 M1 冻结的 final 完全一致。
+       */
+      attachments?: OutboundAttachment[];
+    }
   | { type: 'error'; code: string; message?: string; conversationId?: string; replyTo?: string }
   | { type: 'status'; agent: AgentState; at: number; queued?: number; running?: number };
 

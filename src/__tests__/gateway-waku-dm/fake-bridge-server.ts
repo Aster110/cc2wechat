@@ -111,6 +111,10 @@ export class FakeBridgeServer {
   readonly messages: Array<{ conversationId: string; clientMsgId: string; body: string; senderUserId: string; id: string; convSeq: number }> = [];
   readonly reads: Array<{ conversationId: string; convSeq: number; by: string }> = [];
   readonly heartbeats: Array<Record<string, Json>> = [];
+  /** 每一次 multipart 上传：路由、文件名、mime、字节数、上传者。 */
+  readonly uploads: Array<{ route: string; filename: string; mime: string; bytes: number; by: string; assetId: string }> = [];
+  /** kind != text 的发送：完整 body（断言 image_asset_id / payload / content_id 用）。 */
+  readonly richMessages: Array<{ conversationId: string; kind: string; body: Record<string, Json>; senderUserId: string }> = [];
 
   tokenCalls = 0;
   refreshCalls = 0;
@@ -133,7 +137,11 @@ export class FakeBridgeServer {
   private readonly sseFaults: number[] = [];
   private readonly tokenFaults: number[] = [];
   private readonly refreshTokens = new Map<string, { userId: string; used: boolean }>();
+  private readonly uploadFaults: Array<{ status: number; code?: string; retryAfterSec?: number }> = [];
+  private readonly blobs = new Map<string, { bytes: Buffer; contentType: string; declareLength: boolean }>();
+  private readonly liveContents = new Set<string>();
   private msgCounter = 0;
+  private assetCounter = 0;
 
   constructor(options: FakeBridgeServerOptions) {
     this.personaUserId = options.personaUserId;
@@ -225,6 +233,32 @@ export class FakeBridgeServer {
     this.sendFaults.push(fault);
   }
 
+  failNextUpload(fault: { status: number; code?: string; retryAfterSec?: number }, times = 1): void {
+    for (let i = 0; i < times; i += 1) this.uploadFaults.push(fault);
+  }
+
+  /** 登记一个「可分享」的内容（live + public/friends）。没登记的 content_id 一律 404。 */
+  seedContent(contentId: string): void {
+    this.liveContents.add(contentId);
+  }
+
+  /**
+   * 登记一段"公开可 GET 的媒体字节"（模拟平台给的 GCS URL）。
+   * `declareLength=false` 时不发 Content-Length，用来测「边读边数」那道闸。
+   */
+  seedBlob(name: string, bytes: Buffer, options: { contentType?: string; declareLength?: boolean } = {}): string {
+    this.blobs.set(name, {
+      bytes,
+      contentType: options.contentType ?? 'application/octet-stream',
+      declareLength: options.declareLength ?? true,
+    });
+    return this.blobUrl(name);
+  }
+
+  blobUrl(name: string): string {
+    return `http://127.0.0.1:${this.port}/blobs/${encodeURIComponent(name)}`;
+  }
+
   failNextSse(status: number, times = 1): void {
     for (let i = 0; i < times; i += 1) this.sseFaults.push(status);
   }
@@ -300,6 +334,41 @@ export class FakeBridgeServer {
     return { seq, message };
   }
 
+  /** 推一条带媒体的 chat.message（image / video / voice / playable_card）。 */
+  emitMediaMessage(input: {
+    conversationId: string;
+    senderUserId: string;
+    kind: 'image' | 'video' | 'voice' | 'playable_card';
+    body?: string | null;
+    image?: Record<string, Json>;
+    payload?: Record<string, Json>;
+    card?: Record<string, Json>;
+    id?: string;
+  }): { seq: number; message: FakeChatMessage } {
+    const conv = this.conversations.get(input.conversationId);
+    const convSeq = conv ? ++conv.nextSeq : 1;
+    this.msgCounter += 1;
+    const createdAt = this.now();
+    const message: FakeChatMessage = {
+      id: input.id ?? `cmsg_${String(this.msgCounter).padStart(6, '0')}`,
+      conversation_id: input.conversationId,
+      conversation_kind: conv?.kind ?? 'dm',
+      conv_seq: convSeq,
+      sender_user_id: input.senderUserId,
+      kind: input.kind,
+      body: input.body === undefined ? null : input.body,
+      card: input.card ?? null,
+      image: input.image ?? null,
+      payload: input.payload ?? null,
+      mentions: null,
+      client_msg_id: `client_${this.msgCounter}`,
+      created_at: pythonTimestamp(createdAt),
+      recalled_at: null,
+    };
+    const seq = this.emit('chat.message', { ...(message as unknown as Record<string, Json>) });
+    return { seq, message };
+  }
+
   /** 掐断所有在线 SSE 连接（客户端看到 EOF / 连接重置）。 */
   dropConnections(): void {
     for (const response of this.live) {
@@ -332,6 +401,56 @@ export class FakeBridgeServer {
     if (!issued || issued.revoked) return null;
     if (issued.exp <= Math.floor(this.now() / 1000)) return null;
     return issued;
+  }
+
+  private async readRaw(request: http.IncomingMessage): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(chunk as Buffer);
+    return Buffer.concat(chunks);
+  }
+
+  /**
+   * 极简 multipart 解析：只取第一个 part 的 filename / Content-Type / 字节数。
+   * 够断言"传上去的是这个文件、mime 对、路由对"了，不做完整 RFC 实现。
+   */
+  private handleUpload(
+    route: string,
+    identity: IssuedToken,
+    contentType: string,
+    raw: Buffer,
+    response: http.ServerResponse,
+  ): void {
+    const fault = this.uploadFaults.shift();
+    if (fault !== undefined) {
+      const headers: Record<string, string> = {};
+      if (fault.retryAfterSec !== undefined) headers['Retry-After'] = String(fault.retryAfterSec);
+      this.detail(response, fault.status, fault.code ?? `http_${fault.status}`, fault.code ?? 'fault', headers);
+      return;
+    }
+    const boundaryMatch = /boundary=(?:"([^"]+)"|([^;]+))/.exec(contentType);
+    const boundary = (boundaryMatch?.[1] ?? boundaryMatch?.[2] ?? '').trim();
+    if (boundary.length === 0) {
+      this.detail(response, 400, 'invalid_multipart', 'missing boundary');
+      return;
+    }
+    const text = raw.toString('latin1');
+    const headerEnd = text.indexOf('\r\n\r\n');
+    const partHeaders = headerEnd === -1 ? '' : text.slice(0, headerEnd);
+    const filename = /filename="([^"]*)"/.exec(partHeaders)?.[1] ?? '';
+    const mime = /Content-Type:\s*([^\r\n]+)/i.exec(partHeaders)?.[1]?.trim() ?? '';
+    const tail = text.lastIndexOf(`--${boundary}--`);
+    const bodyStart = headerEnd === -1 ? 0 : headerEnd + 4;
+    const bytes = Math.max(0, (tail === -1 ? text.length : tail) - bodyStart - 2);
+
+    this.assetCounter += 1;
+    const assetId = `ast_${String(this.assetCounter).padStart(6, '0')}`;
+    this.uploads.push({ route, filename, mime, bytes, by: identity.sub, assetId });
+    this.json(response, 200, {
+      asset_id: assetId,
+      public_url: `http://127.0.0.1:${this.port}/assets/${assetId}`,
+      mime_type: mime,
+      size_bytes: bytes,
+    });
   }
 
   private async readBody(request: http.IncomingMessage): Promise<Record<string, Json>> {
@@ -371,8 +490,26 @@ export class FakeBridgeServer {
       if (typeof value === 'string') headers[key.toLowerCase()] = value;
       else if (Array.isArray(value)) headers[key.toLowerCase()] = value.join(',');
     }
-    const body = method === 'GET' ? {} : await this.readBody(request);
+    const contentType = headers['content-type'] ?? '';
+    const isMultipart = contentType.startsWith('multipart/form-data');
+    // multipart 的 body 不是 JSON：单独读原始字节，别喂给 readBody（它会当成 {}）。
+    const rawBody = method === 'GET' ? Buffer.alloc(0) : isMultipart ? await this.readRaw(request) : Buffer.alloc(0);
+    const body = method === 'GET' || isMultipart ? {} : await this.readBody(request);
     this.requests.push({ method, path, headers, body, at: this.now() });
+
+    // 媒体是**匿名可 GET 的公开 URL**（真源就是这样：GCS 公开桶），刻意不校验 Authorization。
+    if (method === 'GET' && path.startsWith('/blobs/')) {
+      const blob = this.blobs.get(decodeURIComponent(path.slice('/blobs/'.length)));
+      if (blob === undefined) {
+        this.json(response, 404, { detail: 'Not Found' });
+        return;
+      }
+      const headers: Record<string, string> = { 'Content-Type': blob.contentType };
+      if (blob.declareLength) headers['Content-Length'] = String(blob.bytes.length);
+      response.writeHead(200, headers);
+      response.end(blob.bytes);
+      return;
+    }
 
     const prefix = '/api/v1';
     if (!path.startsWith(prefix)) {
@@ -425,6 +562,17 @@ export class FakeBridgeServer {
         server_time: new Date(this.now()).toISOString(),
         bridge: { id: this.bridgeId, status: this.bridgeStatus, friend_policy: 'owner_only', name: 'Codex' },
       });
+      return;
+    }
+
+    if (method === 'POST' && (route === '/agent-bridges/me/assets' || route === '/assets')) {
+      // 路由与身份必须对上：bridge JWT 打 /assets 或 session JWT 打 bridge 口都是 403。
+      const wantsBridge = route === '/agent-bridges/me/assets';
+      if (wantsBridge !== (identity.aud === 'vi-agent-bridge')) {
+        this.detail(response, 403, 'forbidden', 'wrong asset route for this identity');
+        return;
+      }
+      this.handleUpload(route, identity, contentType, rawBody, response);
       return;
     }
 
@@ -537,11 +685,20 @@ export class FakeBridgeServer {
       this.detail(response, 403, 'not_friends', 'dm requires mutual follow');
       return;
     }
-    if ((body['kind'] ?? 'text') !== 'text' || typeof text !== 'string' || text.trim().length === 0) {
-      this.detail(response, 400, 'invalid', 'empty body');
+    const kind = String(body['kind'] ?? 'text');
+    if (kind === 'text') {
+      if (typeof text !== 'string' || text.trim().length === 0) {
+        this.detail(response, 400, 'invalid', 'empty body');
+        return;
+      }
+    } else if (!this.validateRichSend(kind, body, response)) {
       return;
     }
+
     const result = this.applySend(conversationId, identity, body);
+    if (kind !== 'text' && result.created) {
+      this.richMessages.push({ conversationId, kind, body, senderUserId: identity.sub });
+    }
     this.json(response, 200, {
       message: {
         id: result.id,
@@ -549,14 +706,62 @@ export class FakeBridgeServer {
         conversation_kind: conv.kind,
         conv_seq: result.convSeq,
         sender_user_id: identity.sub,
-        kind: 'text',
-        body: text,
+        kind,
+        body: typeof text === 'string' ? text : null,
         client_msg_id: clientMsgId,
         created_at: new Date(this.now()).toISOString(),
         source: identity.aud === 'vi-agent-bridge' ? 'agent_bridge' : 'human',
       },
       created: result.created,
     });
+  }
+
+  /** 逐条按 waku-core 的必填字段判：这是"发送契约"在测试里的镜像，不能松。 */
+  private validateRichSend(kind: string, body: Record<string, Json>, response: http.ServerResponse): boolean {
+    const payload = typeof body['payload'] === 'object' && body['payload'] !== null && !Array.isArray(body['payload'])
+      ? (body['payload'] as Record<string, Json>)
+      : null;
+
+    if (kind === 'image') {
+      if (typeof body['image_asset_id'] !== 'string' || (body['image_asset_id'] as string).length === 0) {
+        this.detail(response, 422, 'validation_failed', 'image_asset_id is required');
+        return false;
+      }
+      return true;
+    }
+    if (kind === 'video') {
+      if (payload === null || typeof payload['asset_id'] !== 'string') {
+        this.detail(response, 422, 'validation_failed', 'payload.asset_id is required');
+        return false;
+      }
+      return true;
+    }
+    if (kind === 'voice') {
+      if (payload === null || typeof payload['asset_id'] !== 'string') {
+        this.detail(response, 422, 'validation_failed', 'payload.asset_id is required');
+        return false;
+      }
+      if (typeof payload['duration_ms'] !== 'number' || (payload['duration_ms'] as number) <= 0) {
+        this.detail(response, 422, 'validation_failed', 'payload.duration_ms is required for voice');
+        return false;
+      }
+      return true;
+    }
+    if (kind === 'playable_card') {
+      const contentId = body['content_id'];
+      if (typeof contentId !== 'string' || contentId.length === 0) {
+        this.detail(response, 422, 'validation_failed', 'content_id is required');
+        return false;
+      }
+      // 未登记 = 不存在 / private / 未发布：真后端在这三种情况下都回 404 content_not_found。
+      if (!this.liveContents.has(contentId)) {
+        this.detail(response, 404, 'content_not_found', 'content is not shareable');
+        return false;
+      }
+      return true;
+    }
+    this.detail(response, 422, 'validation_failed', `unsupported kind ${kind}`);
+    return false;
   }
 
   private applySend(
@@ -576,7 +781,7 @@ export class FakeBridgeServer {
     this.messages.push({
       conversationId,
       clientMsgId,
-      body: String(body['body'] ?? ''),
+      body: typeof body['body'] === 'string' ? body['body'] : '',
       senderUserId: identity.sub,
       id,
       convSeq,

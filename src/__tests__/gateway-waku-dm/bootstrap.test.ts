@@ -9,6 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { loadDmGatewayConfig, buildWakuDmGateway, type WakuDmGateway } from '../../gateway/bootstrap/waku-dm.js';
+import { dmPromptPrefix } from '../../gateway/core/ingress.js';
 import { FakeAgent } from '../gateway-core/harness.js';
 import { FakeBridgeServer, RecordingLogger, waitFor, sleep } from './fake-bridge-server.js';
 
@@ -134,6 +135,9 @@ describe('waku-dm · loadDmGatewayConfig', () => {
 });
 
 describe('waku-dm · 端到端（FakeBridgeServer ↔ 真 Core ↔ FakeAgent）', () => {
+  /** FakeAgent 回 `echo:<收到的正文>`；正文带会话前缀（Agent 靠它用回环 CLI 中途发图）。 */
+  const echoOf = (text: string): string => `echo:${dmPromptPrefix(CONV)}${text}`;
+
   async function boot(options: { slowAckMs?: string } = {}): Promise<{ gateway: WakuDmGateway; server: FakeBridgeServer; agent: FakeAgent; log: RecordingLogger }> {
     const dir = tmp();
     const server = new FakeBridgeServer({ personaUserId: PERSONA, ownerUserId: OWNER, credential: CREDENTIAL, keepaliveMs: 50 });
@@ -164,7 +168,7 @@ describe('waku-dm · 端到端（FakeBridgeServer ↔ 真 Core ↔ FakeAgent）'
     const { gateway, server, agent, log } = await boot();
 
     server.emitChatMessage({ conversationId: CONV, senderUserId: OWNER, body: '请只回答这个暗号本身：ZX123456' });
-    await waitFor(() => server.messages.some((m) => m.conversationId === CONV && m.body === 'echo:请只回答这个暗号本身：ZX123456'), { timeoutMs: 5_000, label: 'echo reply' });
+    await waitFor(() => server.messages.some((m) => m.conversationId === CONV && m.body === echoOf('请只回答这个暗号本身：ZX123456')), { timeoutMs: 5_000, label: 'echo reply' });
     expect(agent.turns).toHaveLength(1);
     expect(agent.turns[0].request.cwd).toBe(gateway.config.workspaces['admin-home']);
     expect(server.messages[0].senderUserId).toBe(PERSONA);
@@ -201,11 +205,11 @@ describe('waku-dm · 端到端（FakeBridgeServer ↔ 真 Core ↔ FakeAgent）'
 
     server.emitChatMessage({ conversationId: CONV, senderUserId: OWNER, body: 'first' });
     await waitFor(() => agent.turns.length === 1, { timeoutMs: 5_000 });
-    await waitFor(() => server.messages.some((m) => m.body === 'echo:first'), { timeoutMs: 5_000 });
+    await waitFor(() => server.messages.some((m) => m.body === echoOf('first')), { timeoutMs: 5_000 });
     server.emitChatMessage({ conversationId: CONV, senderUserId: OWNER, body: 'second' });
     await waitFor(() => agent.turns.length === 2, { timeoutMs: 5_000 });
     expect(agent.turns[1].request.binding?.providerSessionId).toBe(`thread_${CONV}`);
-    await waitFor(() => server.messages.some((m) => m.body === 'echo:second'), { timeoutMs: 5_000 });
+    await waitFor(() => server.messages.some((m) => m.body === echoOf('second')), { timeoutMs: 5_000 });
 
     server.emitChatMessage({ conversationId: CONV, senderUserId: OWNER, body: '/new' });
     await waitFor(() => server.messages.some((m) => m.body.includes('新对话')), { timeoutMs: 5_000, label: 'new ack' });

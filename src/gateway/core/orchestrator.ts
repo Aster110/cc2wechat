@@ -17,6 +17,7 @@
  *    它可能已经改过代码、发过消息、删过文件，重放一次比丢一次危险得多。
  */
 import type { AgentEvent } from '../../v6/contracts.js';
+import { mergeAttachments, parseAttachmentMarkers } from './attachments.js';
 import type { MailboxKind, SecurePayload } from '../contracts/envelope.js';
 import type { EndpointStatus, RunnerDescriptor } from '../contracts/runner.js';
 import { isGatewayError } from '../contracts/validation.js';
@@ -40,6 +41,8 @@ export interface TurnJob {
   text: string;
   clientSeq: number;
   receivedAt: number;
+  /** 通道已下载好的本机媒体路径；缺省空数组（V1 加密信箱没有媒体）。 */
+  mediaPaths?: string[];
 }
 
 export interface ControlCommand {
@@ -97,9 +100,20 @@ export interface GatewayHealth {
   lastTurn: { outcome: TurnOutcome; totalMs: number } | null;
 }
 
+/** 回环回复口用来推断"当前是哪条会话"：正在跑的 turn 的会话清单。 */
+export interface RunningTurnSummary {
+  turnId: string;
+  conversationId: string;
+  pairingId: string;
+  routeId: string;
+  keyVersion: number;
+}
+
 export interface GatewayOrchestrator extends TurnDispatcher {
   /** 启动时调用一次：把上次崩溃留下的 running turn 标成 interrupted，不重跑。 */
   recover(): { interrupted: number };
+  /** 正在跑的 turn（回环回复口据此推断默认会话；多于一条就必须显式指定）。 */
+  runningTurns(): RunningTurnSummary[];
   /** SIGTERM 语义：不再接新 turn，等当前 turn 收尾。 */
   drain(): Promise<void>;
   health(): Promise<GatewayHealth>;
@@ -255,7 +269,8 @@ export function createGatewayOrchestrator(
           conversationId: job.conversationId,
           turnId: running.turnId,
           text: job.text,
-          mediaPaths: [],
+          // 入站媒体一路贯通到 Agent：写死 [] 等于图片下载完就扔，codex 永远看不到。
+          mediaPaths: job.mediaPaths ?? [],
         },
         running.controller.signal,
       );
@@ -332,14 +347,20 @@ export function createGatewayOrchestrator(
         });
         return;
 
-      case 'final':
+      case 'final': {
+        // Agent 只会说话：附件靠正文里的 `[[send-…]]` 标记 + 它自己产出的 mediaFiles 表达。
+        // 解析放这里（Core），通道拿到的是已经归一好的清单——词法不会在两条链路上分叉。
+        const parsed = parseAttachmentMarkers(event.text);
+        const attachments = mergeAttachments(event.mediaFiles, parsed.attachments);
         await publish(job, 'final', {
           type: 'final',
           conversationId: job.conversationId,
           replyTo: job.messageId,
-          text: event.text,
+          text: parsed.text,
+          ...(attachments.length === 0 ? {} : { attachments }),
         });
         return;
+      }
 
       case 'error':
         await publish(job, 'error', {
@@ -488,6 +509,22 @@ export function createGatewayOrchestrator(
 
     recover(): { interrupted: number } {
       return { interrupted: store.recoverInterruptedTurns(now()).length };
+    },
+
+    runningTurns(): RunningTurnSummary[] {
+      const out: RunningTurnSummary[] = [];
+      for (const state of states.values()) {
+        const running = state.running;
+        if (running === null) continue;
+        out.push({
+          turnId: running.turnId,
+          conversationId: running.job.conversationId,
+          pairingId: running.job.pairingId,
+          routeId: running.job.routeId,
+          keyVersion: running.job.keyVersion,
+        });
+      }
+      return out;
     },
 
     async drain(): Promise<void> {
