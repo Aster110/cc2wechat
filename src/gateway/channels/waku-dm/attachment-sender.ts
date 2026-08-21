@@ -37,6 +37,8 @@ export interface AttachmentSenderConfig {
   /** `WAKU_DM_VIDEO_TRANSCODE=1` 才打开：转到 720p H.264 且截断到 maxVideoSeconds。 */
   transcodeVideo?: boolean;
   maxVideoSeconds?: number;
+  /** 出站单文件上限，缺省 200 MiB。 */
+  maxUploadBytes?: number;
 }
 
 export type AttachmentOutcome =
@@ -48,6 +50,12 @@ export type AttachmentOutcome =
   | { status: 'failed'; kind: 'retryable' | 'permanent-failure' | 'unknown'; code: string; retryAfterMs?: number };
 
 export const DEFAULT_MAX_VIDEO_SECONDS = 60;
+/**
+ * 出站单文件上限。上传要把整个文件读进内存（multipart），没有这道闸的话
+ * Agent 一句 `[[send-video: /path/to/4GB.mov]]` 就能把 daemon 撑爆——
+ * 而平台那边本来也会拒。宁可当场回一句人话。
+ */
+export const DEFAULT_MAX_UPLOAD_BYTES = 200 * 1024 * 1024;
 /** 上传缓存的寿命：比出站 outbox 的 TTL 长一截就够，不必永久。 */
 export const ASSET_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -92,6 +100,7 @@ export function createAttachmentSender(
   log: GatewayLogger,
 ): AttachmentSender {
   const maxVideoSeconds = config.maxVideoSeconds ?? DEFAULT_MAX_VIDEO_SECONDS;
+  const maxUploadBytes = config.maxUploadBytes ?? DEFAULT_MAX_UPLOAD_BYTES;
 
   /** 上传一个本机文件，命中缓存就不走网络。 */
   async function uploadCached(filePath: string): Promise<string> {
@@ -109,14 +118,20 @@ export function createAttachmentSender(
   }
 
   function readableFile(filePath: string): { ok: true; size: number } | { ok: false; notice: string } {
+    let stat: fs.Stats;
     try {
-      const stat = fs.statSync(filePath);
-      if (!stat.isFile()) return { ok: false, notice: `附件不是一个文件：${path.basename(filePath)}` };
-      if (stat.size === 0) return { ok: false, notice: `附件是空文件：${path.basename(filePath)}` };
-      return { ok: true, size: stat.size };
+      stat = fs.statSync(filePath);
     } catch {
       return { ok: false, notice: `附件不存在或读不到：${filePath}` };
     }
+    if (!stat.isFile()) return { ok: false, notice: `附件不是一个文件：${path.basename(filePath)}` };
+    if (stat.size === 0) return { ok: false, notice: `附件是空文件：${path.basename(filePath)}` };
+    if (stat.size > maxUploadBytes) {
+      const mib = (n: number): string => `${Math.round(n / (1024 * 1024))} MiB`;
+      log.error(`   attachment too large: ${path.basename(filePath)} ${stat.size}B > ${maxUploadBytes}B; not uploaded`);
+      return { ok: false, notice: `这个文件太大发不了（${mib(stat.size)} > ${mib(maxUploadBytes)}），先留在本机：${filePath}` };
+    }
+    return { ok: true, size: stat.size };
   }
 
   async function sendImage(conversationId: string, clientMsgId: string, attachment: OutboundAttachment): Promise<AttachmentOutcome> {

@@ -57,7 +57,7 @@ import {
   type MediaStore,
 } from '../channels/waku-dm/media-store.js';
 import { createMediaProbe } from '../channels/waku-dm/media-probe.js';
-import { ASSET_CACHE_TTL_MS } from '../channels/waku-dm/attachment-sender.js';
+import { ASSET_CACHE_TTL_MS, DEFAULT_MAX_UPLOAD_BYTES } from '../channels/waku-dm/attachment-sender.js';
 import { mergeAttachments, parseAttachmentMarkers, type OutboundAttachment } from '../core/attachments.js';
 import { DEFAULT_DM_STATE_DIR_NAME, HEALTH_PORT_FILE } from '../dm-paths.js';
 import { SSE_IDLE_TIMEOUT_MS } from '../channels/waku-dm/sse-client.js';
@@ -118,6 +118,8 @@ export interface DmGatewayConfig {
   /** `WAKU_DM_VIDEO_TRANSCODE=1`：发视频前转到 720p H.264 并截断。默认关（不替用户改画质）。 */
   videoTranscode: boolean;
   maxVideoSeconds: number;
+  /** 出站单文件上限（上传要整个读进内存）。 */
+  maxUploadBytes: number;
   codexHome: string | null;
   codexEffort: string | null;
   agentBackend: string | null;
@@ -246,6 +248,7 @@ export function loadDmGatewayConfig(env: NodeJS.ProcessEnv = process.env): DmGat
     mediaSweepIntervalMs: readInt(env, 'MEDIA_SWEEP_INTERVAL_MS', WAKU_DM_MEDIA_SWEEP_INTERVAL_MS),
     videoTranscode: (env['WAKU_DM_VIDEO_TRANSCODE'] ?? '').trim() === '1',
     maxVideoSeconds: readInt(env, 'MAX_VIDEO_SECONDS', 60),
+    maxUploadBytes: readInt(env, 'MAX_UPLOAD_BYTES', DEFAULT_MAX_UPLOAD_BYTES),
     codexHome: readEnv(env, 'CODEX_HOME'),
     codexEffort: readEnv(env, 'CODEX_EFFORT'),
     agentBackend: readEnv(env, 'AGENT_BACKEND'),
@@ -471,6 +474,7 @@ export function buildWakuDmGateway(options: BuildDmOptions): WakuDmGateway {
     tmpDir: path.join(config.stateDir, 'outbound'),
     transcodeVideo: config.videoTranscode,
     maxVideoSeconds: config.maxVideoSeconds,
+    maxUploadBytes: config.maxUploadBytes,
   };
 
   const adapter = createWakuDmAdapter({

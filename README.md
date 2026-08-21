@@ -274,7 +274,7 @@ node dist/gateway/server.js
 | `CC2WECHAT_ACK_MS` | Slow-turn notice (“收到，正在处理…”); `0` disables | `60000` |
 | `WAKU_GATEWAY_MEDIA_DIR` / `MEDIA_TTL_MS` / `MEDIA_SWEEP_INTERVAL_MS` | Where inbound media lands, how long it lives, how often it is swept | `<state>/media` / `86400000` / `3600000` |
 | `WAKU_GATEWAY_MEDIA_IMAGE_MAX_BYTES` / `MEDIA_MAX_BYTES` / `MEDIA_TIMEOUT_MS` | Inbound size caps (image / video+voice) and per-download timeout | `16MiB` / `100MiB` / `60000` |
-| `WAKU_DM_VIDEO_TRANSCODE` | `1` = transcode outbound video to 720p H.264 (needs ffmpeg); off by default | off |
+| `WAKU_DM_VIDEO_TRANSCODE` / `WAKU_GATEWAY_MAX_UPLOAD_BYTES` | Transcode outbound video to 720p H.264 (needs ffmpeg); outbound per-file cap | off / `200MiB` |
 | `WAKU_GATEWAY_WORKSPACE_DIR` / `AGENT_BACKEND` / `CODEX_HOME` / `CODEX_EFFORT` / `NODE_ID` / `ENDPOINT_ID` / `TRUST_TIER` | Same as the V1 gateway | same |
 
 Commands inside the DM: `/new` (fresh context, same conversation), `/stop`, `/exit`, `/help`.

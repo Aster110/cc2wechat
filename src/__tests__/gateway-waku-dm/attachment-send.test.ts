@@ -101,7 +101,7 @@ afterEach(async () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-function makeAdapter(overrides: { tokens?: BridgeTokenProvider; transcodeVideo?: boolean } = {}): WakuDmAdapter {
+function makeAdapter(overrides: { tokens?: BridgeTokenProvider; transcodeVideo?: boolean; maxUploadBytes?: number } = {}): WakuDmAdapter {
   const tokens = overrides.tokens ?? provider;
   const chat = createWakuChatClient({ apiBase: server.apiBase, tokens });
   const adapter = createWakuDmAdapter({
@@ -122,6 +122,7 @@ function makeAdapter(overrides: { tokens?: BridgeTokenProvider; transcodeVideo?:
       },
       tmpDir: path.join(dir, 'outbound'),
       ...(overrides.transcodeVideo === undefined ? {} : { transcodeVideo: overrides.transcodeVideo }),
+      ...(overrides.maxUploadBytes === undefined ? {} : { maxUploadBytes: overrides.maxUploadBytes }),
     },
   });
   adapters.push(adapter);
@@ -240,6 +241,16 @@ describe('waku-dm · 出站附件', () => {
     expect((await adapter.send(finalWith([{ kind: 'file', path: file }], ''))).status).toBe('sent');
     expect(server.uploads).toHaveLength(0);
     expect(server.messages.at(-1)!.body).toContain(file);
+  });
+
+  it('超过出站上限 → 不读进内存、不上传，回一句人话（Agent 一句标记不该能撑爆 daemon）', async () => {
+    const adapter = makeAdapter({ maxUploadBytes: 64 });
+    const file = writeFile('big.png', Buffer.concat([pngOf(2, 3), Buffer.alloc(4096, 1)]));
+
+    expect((await adapter.send(finalWith([{ kind: 'image', path: file }], ''))).status).toBe('sent');
+    expect(server.uploads).toHaveLength(0);
+    expect(server.messages.at(-1)!.body).toContain('太大发不了');
+    expect(log.find(/attachment too large/)).toHaveLength(1);
   });
 
   it('附件不存在 → 一句人话，不炸也不重投', async () => {

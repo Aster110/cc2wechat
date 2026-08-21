@@ -116,6 +116,9 @@ Agent 只会说话，所以最终文本里的标记就是它唯一的出口。�
 | `[[send-card: cnt_x]]` / `[[send-card: cnt_x launch_ctx={"room":"AB"}]]` | `playable_card` | 内容必须 `live` 且 `visibility ∈ {public, friends}` |
 | `[[send-file: /abs/path]]` | —（Waku 没有 file kind） | 不发，回一句"文件留在本机 `<path>`" |
 
+出站单文件上限 200 MiB（`WAKU_GATEWAY_MAX_UPLOAD_BYTES`）：multipart 上传要把整个文件读进内存，
+没有这道闸的话 Agent 一句 `[[send-video: /path/to/4GB.mov]]` 就能把 daemon 撑爆——超限当场回一句人话，不上传。
+
 `AgentEvent.final.mediaFiles` 也会合流（按扩展名判类型），mediaFiles 在前、标记在后，同一路径只发一次。
 不认识的标记（`[[send-sticker: …]]`）原样留在正文——宁可难看也不静默吞掉 Agent 想说的话。
 
@@ -186,6 +189,7 @@ waku-dm-reply --conversation conv_01J… --video /tmp/demo.mp4 --text "跑起来
 | `WAKU_GATEWAY_MEDIA_SWEEP_INTERVAL_MS` | 清理周期 | `3600000`（1h） |
 | `WAKU_DM_VIDEO_TRANSCODE` | `1` = 出站视频转 720p H.264 并截断到 `MAX_VIDEO_SECONDS`（需要 ffmpeg） | 关 |
 | `WAKU_GATEWAY_MAX_VIDEO_SECONDS` | 转码时的截断长度 | `60` |
+| `WAKU_GATEWAY_MAX_UPLOAD_BYTES` | **出站**单文件上限（上传要整个读进内存；超了回一句人话不发） | `209715200`（200 MiB） |
 | `WAKU_GATEWAY_NODE_ID` / `ENDPOINT_ID` / `TRUST_TIER` / `WORKSPACE_POLICY_ID` / `RUNNER_PROFILE_ID` / `QUEUE_CAP` / `OUTBOX_TTL_MS` / `FLUSH_INTERVAL_MS` | 沿用 V1 | 沿用 |
 
 ## Runbook
