@@ -18,16 +18,28 @@
  * 另有一个只读诊断开关：`--sse-smoke <秒>`——用配置里的凭证订阅 `/users/me/events` N 秒，
  * 只打印事件名与 seq（不打印 token、不打印正文），用真后端验证帧解析与鉴权链路。
  */
+import fs from 'node:fs';
 import http from 'node:http';
+import path from 'node:path';
 
 import { isGatewayError } from './contracts/validation.js';
 import { buildWakuGateway, loadGatewayConfig, readEnv, type IssuedGrant, type WakuGateway } from './bootstrap/waku.js';
-import { buildWakuDmGateway, createBridgeTokenProvider, loadDmGatewayConfig } from './bootstrap/waku-dm.js';
+import {
+  buildWakuDmGateway,
+  createBridgeTokenProvider,
+  HEALTH_PORT_FILE,
+  loadDmGatewayConfig,
+  type DmReplyInput,
+  type DmReplyResult,
+} from './bootstrap/waku-dm.js';
+
+export { HEALTH_PORT_FILE };
 import { createSseSubscription } from './channels/waku-dm/sse-client.js';
 import { createStdLogger } from './log.js';
 
 const HEALTH_PATH = '/health';
 const PAIR_GRANT_PATH = '/admin/pair-grant';
+const REPLY_PATH = '/admin/reply';
 
 const stdLog = createStdLogger('waku-gateway');
 
@@ -49,13 +61,15 @@ function respond(response: http.ServerResponse, status: number, body: unknown): 
   response.end(text);
 }
 
-/** 运维口的请求体上限：这两个接口的入参就几十字节，超了一定是打错门了。 */
-const MAX_BODY_BYTES = 4096;
+/**
+ * 运维口的请求体上限。配对码接口只有几十字节；回复接口要装一段文本 + 几条附件路径，
+ * 但**正文本身也受平台 4000 字符限制**，64 KiB 已经宽得离谱——超了一定是打错门了。
+ */
+const MAX_BODY_BYTES = 64 * 1024;
 
 type GrantRequest = NonNullable<Parameters<WakuGateway['issueGrant']>[0]>;
 
-/** 只认这三个旋钮；多余字段一律无视（签发权已经由"能连上回环"这件事决定了）。 */
-async function readJsonBody(request: http.IncomingMessage): Promise<GrantRequest> {
+async function readBodyRecord(request: http.IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of request) {
@@ -65,11 +79,14 @@ async function readJsonBody(request: http.IncomingMessage): Promise<GrantRequest
     chunks.push(buffer);
   }
   if (size === 0) return {};
-
   const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return {};
-  const record = parsed as Record<string, unknown>;
+  return parsed as Record<string, unknown>;
+}
 
+/** 只认这三个旋钮；多余字段一律无视（签发权已经由"能连上回环"这件事决定了）。 */
+async function readJsonBody(request: http.IncomingMessage): Promise<GrantRequest> {
+  const record = await readBodyRecord(request);
   const body: GrantRequest = {};
   if (typeof record.endpointId === 'string') body.endpointId = record.endpointId;
   if (typeof record.ttlMs === 'number') body.ttlMs = record.ttlMs;
@@ -80,10 +97,59 @@ async function readJsonBody(request: http.IncomingMessage): Promise<GrantRequest
   return body;
 }
 
-/** 运维口看得到的 gateway 投影：两种通道都有 health；只有 V1 信箱能签配对码。 */
+/**
+ * `POST /admin/reply` 的入参。附件只认白名单里的字段——回环口虽然只听 127.0.0.1，
+ * 但"本机进程"不等于"我们写的进程"，别把任意 JSON 原样塞进出站载荷。
+ */
+export function parseReplyBody(record: Record<string, unknown>): ReplyRequest {
+  const body: ReplyRequest = {};
+  if (typeof record.conversationId === 'string' && record.conversationId.length > 0) {
+    body.conversationId = record.conversationId;
+  }
+  if (typeof record.text === 'string') body.text = record.text;
+
+  const raw = Array.isArray(record.attachments) ? record.attachments : [];
+  const attachments: NonNullable<ReplyRequest['attachments']> = [];
+  for (const entry of raw) {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue;
+    const item = entry as Record<string, unknown>;
+    const kind = item.kind;
+    if (kind !== 'image' && kind !== 'video' && kind !== 'audio' && kind !== 'card' && kind !== 'file') continue;
+    const attachment: NonNullable<ReplyRequest['attachments']>[number] = { kind };
+    if (typeof item.path === 'string' && item.path.length > 0) attachment.path = item.path;
+    if (typeof item.contentId === 'string' && item.contentId.length > 0) attachment.contentId = item.contentId;
+    if (typeof item.caption === 'string' && item.caption.length > 0) attachment.caption = item.caption;
+    if (typeof item.launchCtx === 'object' && item.launchCtx !== null && !Array.isArray(item.launchCtx)) {
+      const ctx: Record<string, string> = {};
+      for (const [key, value] of Object.entries(item.launchCtx as Record<string, unknown>)) {
+        if (typeof value === 'string') ctx[key] = value;
+      }
+      if (Object.keys(ctx).length > 0) attachment.launchCtx = ctx;
+    }
+    attachments.push(attachment);
+  }
+  if (attachments.length > 0) body.attachments = attachments;
+  return body;
+}
+
+export type ReplyRequest = Omit<DmReplyInput, 'attachments'> & {
+  attachments?: Array<{
+    kind: 'image' | 'video' | 'audio' | 'card' | 'file';
+    path?: string;
+    contentId?: string;
+    caption?: string;
+    launchCtx?: Record<string, string>;
+  }>;
+};
+
+/**
+ * 运维口看得到的 gateway 投影：两种通道都有 health；只有 V1 信箱能签配对码，
+ * 只有 waku-dm 能回环回复。
+ */
 export interface OpsGateway {
   health(): Promise<{ core: { ok: boolean } }>;
   issueGrant?(input?: GrantRequest): Promise<IssuedGrant>;
+  reply?(input: ReplyRequest): Promise<DmReplyResult>;
 }
 
 /**
@@ -120,6 +186,25 @@ export function createOpsServer(gateway: OpsGateway): http.Server {
       return;
     }
 
+    if (method === 'POST' && url.startsWith(REPLY_PATH)) {
+      const reply = gateway.reply;
+      if (reply === undefined) {
+        respond(response, 404, { error: 'reply_not_supported_on_this_channel' });
+        return;
+      }
+      readBodyRecord(request)
+        .then((record) => reply.call(gateway, parseReplyBody(record)))
+        .then((result) => respond(response, 200, result))
+        .catch((error: unknown) =>
+          respond(response, 400, {
+            error: isGatewayError(error) ? error.code : 'reply_failed',
+            // 这条会被 CLI 直接打给用户看：它讲的是"该传哪个参数"，不含任何凭证。
+            message: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      return;
+    }
+
     respond(response, 404, { error: 'not_found' });
   });
 }
@@ -131,6 +216,8 @@ interface RunningDaemon {
   healthHost: string;
   healthPort: number;
   summary: string;
+  /** 端口发现文件落在哪个 state dir（只有 waku-dm 需要——回环回复 CLI 靠它）。 */
+  stateDir?: string;
 }
 
 async function buildMailboxDaemon(): Promise<RunningDaemon> {
@@ -178,7 +265,21 @@ async function buildDmDaemon(): Promise<RunningDaemon> {
     summary:
       `channel=waku-dm mode=${config.credential.mode} node=${config.nodeId} endpoint=${config.endpoint.id} ` +
       `owners=${config.ownerUserIds.length} defaultTier=${config.defaultTier} state=${config.stateDir}`,
+    stateDir: config.stateDir,
   };
+}
+
+/** 端口发现文件：写不进去不是致命错（CLI 还能用 env），但要说一声。 */
+function writeHealthPortFile(stateDir: string, port: number): string | null {
+  const file = path.join(stateDir, HEALTH_PORT_FILE);
+  try {
+    fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(file, `${port}\n`, { encoding: 'utf8', mode: 0o600 });
+    return file;
+  } catch {
+    logError(`could not write ${file}: waku-dm-reply will need WAKU_GATEWAY_HEALTH_PORT`);
+    return null;
+  }
 }
 
 /**
@@ -259,6 +360,8 @@ async function main(): Promise<void> {
     ops.listen(daemon.healthPort, daemon.healthHost, resolve);
   });
 
+  const portFile = daemon.stateDir === undefined ? null : writeHealthPortFile(daemon.stateDir, daemon.healthPort);
+
   log(`listening on http://${daemon.healthHost}:${daemon.healthPort}${HEALTH_PATH} (${daemon.summary})`);
 
   let shuttingDown = false;
@@ -267,6 +370,7 @@ async function main(): Promise<void> {
     shuttingDown = true;
     log(`${signal} received, draining`);
     ops.close();
+    if (portFile !== null) fs.rmSync(portFile, { force: true });
     daemon
       .stop()
       .then(() => {
@@ -283,10 +387,17 @@ async function main(): Promise<void> {
   process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
-main().catch((error: unknown) => {
-  // 错误消息里可能带路径，但绝不带 token —— 各层的错误都只写字段名与 code。
-  const detail = error instanceof Error ? error.message : String(error);
-  const code = isGatewayError(error) ? `${error.code}: ` : '';
-  logError(`startup failed — ${code}${detail}`);
-  process.exit(1);
-});
+/**
+ * 只有被当成进程入口跑起来时才起 daemon。
+ * 单测要 import `createOpsServer` / `parseReplyBody`，import 的副作用不能是"顺手开一台 daemon"。
+ */
+const invokedDirectly = process.argv[1] !== undefined && /gateway[/\\]server(\.[cm]?[jt]s)?$/.test(process.argv[1]);
+if (invokedDirectly) {
+  main().catch((error: unknown) => {
+    // 错误消息里可能带路径，但绝不带 token —— 各层的错误都只写字段名与 code。
+    const detail = error instanceof Error ? error.message : String(error);
+    const code = isGatewayError(error) ? `${error.code}: ` : '';
+    logError(`startup failed — ${code}${detail}`);
+    process.exit(1);
+  });
+}

@@ -242,7 +242,10 @@ The daemon automatically starts a ttyd instance for each tmux session. The URL i
 Besides WeChat, the same Core can serve a **Waku AI-friend persona**: users DM the persona inside the
 Waku app, a local daemon subscribes to the persona's event bus over SSE, hands the text to your local
 Codex, and posts the reply back into the same DM. No inbound ports, no new transport — platform JWT +
-REST + SSE. Full architecture, env table and troubleshooting: [docs/waku-dm-channel.md](docs/waku-dm-channel.md).
+REST + SSE. Media works both ways: inbound images/videos/voice notes are downloaded to disk and handed
+to Codex as local paths, and Codex sends images/videos/voice/playable cards back with `[[send-…]]`
+markers or the `waku-dm-reply` CLI. Full architecture, env table and troubleshooting:
+[docs/waku-dm-channel.md](docs/waku-dm-channel.md).
 
 ```bash
 npm run build
@@ -269,14 +272,27 @@ node dist/gateway/server.js
 | `WAKU_GATEWAY_STATE_DIR` / `HEALTH_PORT` | Own SQLite + loopback ops port (can run next to the V1 daemon) | `~/.waku-gateway-dm` / `18092` |
 | `WAKU_GATEWAY_HEARTBEAT_INTERVAL_MS` / `SSE_IDLE_TIMEOUT_MS` / `COLD_START_GRACE_MS` | Heartbeat cadence, SSE dead-connection threshold, how old a cold-start replay may be | `30000` / `30000` / `60000` |
 | `CC2WECHAT_ACK_MS` | Slow-turn notice (“收到，正在处理…”); `0` disables | `60000` |
+| `WAKU_GATEWAY_MEDIA_DIR` / `MEDIA_TTL_MS` / `MEDIA_SWEEP_INTERVAL_MS` | Where inbound media lands, how long it lives, how often it is swept | `<state>/media` / `86400000` / `3600000` |
+| `WAKU_GATEWAY_MEDIA_IMAGE_MAX_BYTES` / `MEDIA_MAX_BYTES` / `MEDIA_TIMEOUT_MS` | Inbound size caps (image / video+voice) and per-download timeout | `16MiB` / `100MiB` / `60000` |
+| `WAKU_DM_VIDEO_TRANSCODE` | `1` = transcode outbound video to 720p H.264 (needs ffmpeg); off by default | off |
 | `WAKU_GATEWAY_WORKSPACE_DIR` / `AGENT_BACKEND` / `CODEX_HOME` / `CODEX_EFFORT` / `NODE_ID` / `ENDPOINT_ID` / `TRUST_TIER` | Same as the V1 gateway | same |
 
 Commands inside the DM: `/new` (fresh context, same conversation), `/stop`, `/exit`, `/help`.
 
+**Media & attachments.** Inbound: the daemon downloads the file into `<state>/media/<conv>/<msg>-<i>.<ext>`
+(capped, 60s timeout, swept after 24h) and appends `[Image: /path]` / `[Video: /path]` / `[Voice: /path]`
+to the text, so Codex gets real local paths (`localImage` / `localAudio`); shared playables become a text
+`[Card: <title> content_id=… share_url=…]` marker. Outbound: Codex writes `[[send-image: /abs/path]]`,
+`[[send-video: …]]`, `[[send-audio: …]]`, `[[send-card: cnt_… launch_ctx={"room":"AB"}]]` in its final
+answer, or calls `waku-dm-reply --image /tmp/shot.png` mid-turn (loopback HTTP to the daemon's ops port;
+without `--conversation` it targets the single running turn and refuses to guess when there are zero or
+several). Install the Codex-facing skill with `cc2wechat skill install waku-dm`.
+
 Health: `node dist/gateway/cli.js health` (with `WAKU_GATEWAY_CHANNEL=waku-dm`) or `curl 127.0.0.1:18092/health` —
 `channel: {type, state, cursor, lastEventAt, lastHeartbeatAt, reconnects, tokenState, selfUserId}` plus the V1 `core/runner/endpoints/queues/outbox` blocks.
 Read-only transport smoke against the real backend: `node dist/gateway/server.js --sse-smoke 15` (prints event names and seqs only).
-Golden path: `PERSONA_USER_ID=<id> node scripts/golden-e2e-dm.mjs`.
+Golden path: `PERSONA_USER_ID=<id> node scripts/golden-e2e-dm.mjs`;
+media golden path (image in → Codex reads the nonce → image out): `PERSONA_USER_ID=<id> node scripts/golden-e2e-dm-media.mjs`.
 
 ## License
 

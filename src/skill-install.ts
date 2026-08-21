@@ -7,6 +7,14 @@ export interface SkillInstallResult {
 }
 
 /**
+ * 随包分发的 skill。加一条 = 让 `cc2wechat skill install` 默认把它也装上。
+ * - `cc2wechat`：微信通道的操作手册
+ * - `waku-dm`：Waku 私聊通道——收到 `[Image: path]` 怎么读、回图/回卡片怎么发、做 playable 的标准流程
+ */
+export const BUNDLED_SKILLS = ['cc2wechat', 'waku-dm'] as const;
+export type BundledSkill = (typeof BUNDLED_SKILLS)[number];
+
+/**
  * Copy a bundled skill (<pkgRoot>/skills/<name>) into <home>/.claude/skills/<name>.
  * Refuses to overwrite an existing target unless force=true.
  */

@@ -59,6 +59,7 @@ import {
 import { createMediaProbe } from '../channels/waku-dm/media-probe.js';
 import { ASSET_CACHE_TTL_MS } from '../channels/waku-dm/attachment-sender.js';
 import { mergeAttachments, parseAttachmentMarkers, type OutboundAttachment } from '../core/attachments.js';
+import { DEFAULT_DM_STATE_DIR_NAME, HEALTH_PORT_FILE } from '../dm-paths.js';
 import { SSE_IDLE_TIMEOUT_MS } from '../channels/waku-dm/sse-client.js';
 import {
   DEFAULT_DM_HEALTH_PORT,
@@ -122,12 +123,8 @@ export interface DmGatewayConfig {
   agentBackend: string | null;
 }
 
-export const DEFAULT_DM_STATE_DIR_NAME = '.waku-gateway-dm';
-/**
- * daemon 启动时把自己的回环端口写进 `<stateDir>/health.port`，`waku-dm-reply` 靠它找到我们。
- * 常量放在**没有副作用**的模块里：放进 server.ts 会让 CLI 一 import 就把 daemon 的 main() 跑起来。
- */
-export const HEALTH_PORT_FILE = 'health.port';
+/** 唯一定义在 `../dm-paths.js`（那个文件没有任何 import，CLI 拿常量不必拖进整条依赖链）。 */
+export { DEFAULT_DM_STATE_DIR_NAME, HEALTH_PORT_FILE };
 export const DEFAULT_GUEST_ENDPOINT_ID = 'guest';
 export const DEFAULT_GUEST_WORKSPACE_POLICY_ID = 'guest-home';
 
