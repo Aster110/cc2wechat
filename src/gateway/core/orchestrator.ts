@@ -74,6 +74,21 @@ export interface TurnDispatcher {
 
 export type TurnOutcome = 'final' | 'error' | 'aborted' | 'interrupted';
 
+/** 每轮收尾时交给观测面的一行计时（`[turn] conv= agent= queue= first= total= outcome=` 的数据源）。 */
+export interface TurnTiming {
+  turnId: string;
+  conversationId: string;
+  pairingId: string;
+  agentType: string;
+  /** 收到到开跑的等待。 */
+  queueMs: number;
+  /** 开跑到首个 Agent 事件；一个事件都没有时为 -1。 */
+  firstEventMs: number;
+  totalMs: number;
+  outcome: TurnOutcome;
+  endedAt: number;
+}
+
 export interface GatewayHealth {
   core: { ok: boolean };
   runner: { nodeId: string; ok: boolean };
@@ -109,6 +124,8 @@ export interface GatewayOrchestratorOptions {
   now(): number;
   newTurnId(): string;
   queueCap?: number;
+  /** 观测钩子：每轮收尾调一次（组装层拿它打 `[turn]` 日志）。抛错不影响 turn 收尾。 */
+  onTurnFinished?: (timing: TurnTiming) => void;
 }
 
 /** 单会话积压上限，沿用 v6 的口径。满了就明确拒，不做无限缓冲。 */
@@ -187,25 +204,50 @@ export function createGatewayOrchestrator(
    * turn 收尾。**吞掉存储异常**：这段跑在 finally 里，而它最常见的失败场景是
    * "库已经被关了/进程正在退出"——那时候再抛一个未捕获的 rejection 只会盖住真正的原因。
    */
-  function finishTurn(turnId: string, outcome: TurnOutcome, startedAt: number): void {
-    lastTurn = { outcome, totalMs: now() - startedAt };
+  function finishTurn(
+    running: RunningTurn,
+    outcome: TurnOutcome,
+    agentType: string,
+    firstEventAt: number | null,
+  ): void {
+    const endedAt = now();
+    lastTurn = { outcome, totalMs: endedAt - running.startedAt };
     try {
       store.transaction((tx) =>
-        tx.finishTurn(turnId, outcome === 'final' || outcome === 'error' ? 'completed' : 'interrupted', now()),
+        tx.finishTurn(running.turnId, outcome === 'final' || outcome === 'error' ? 'completed' : 'interrupted', endedAt),
       );
     } catch {
       /* 收尾写不进去就算了：turn 的真相由崩溃恢复那条路补（running → interrupted） */
+    }
+    if (options.onTurnFinished !== undefined) {
+      try {
+        options.onTurnFinished({
+          turnId: running.turnId,
+          conversationId: running.job.conversationId,
+          pairingId: running.job.pairingId,
+          agentType,
+          queueMs: Math.max(0, running.startedAt - running.job.receivedAt),
+          firstEventMs: firstEventAt === null ? -1 : firstEventAt - running.startedAt,
+          totalMs: endedAt - running.startedAt,
+          outcome,
+          endedAt,
+        });
+      } catch {
+        /* 观测钩子不许把 turn 收尾弄挂 */
+      }
     }
   }
 
   async function executeTurn(state: PairingState, running: RunningTurn): Promise<void> {
     const { job } = running;
     let outcome: TurnOutcome = 'aborted';
+    let agentType = 'unknown';
+    let firstEventAt: number | null = null;
 
     try {
       // 派活时再解析一次 endpoint：从入队到轮到它，中间可能已经被 disable 了。
       const { endpoint, runner } = registry.resolve(job.endpointId);
-      const agentType = agentTypeOf(runner.descriptor);
+      agentType = agentTypeOf(runner.descriptor);
 
       const stream = runner.run(
         endpoint,
@@ -219,6 +261,7 @@ export function createGatewayOrchestrator(
       );
 
       for await (const event of stream) {
+        if (firstEventAt === null) firstEventAt = now();
         await handleAgentEvent(job, agentType, event);
         if (event.type === 'final') outcome = 'final';
         else if (event.type === 'error') outcome = 'error';
@@ -247,7 +290,7 @@ export function createGatewayOrchestrator(
         /* 连错误都发不出去（通道也挂了）：留给 outbox 重投与健康面去暴露 */
       }
     } finally {
-      finishTurn(running.turnId, outcome, running.startedAt);
+      finishTurn(running, outcome, agentType, firstEventAt);
       state.running = null;
       pump(state);
     }
