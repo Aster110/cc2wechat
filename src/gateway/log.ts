@@ -28,3 +28,33 @@ export const silentLogger: GatewayLogger = {
   info: () => undefined,
   error: () => undefined,
 };
+
+/**
+ * 内部错误 message 进日志/回执前的截断长度：留够定位，又不至于把一整篇 stack 灌进来。
+ */
+export const INTERNAL_ERROR_DETAIL_MAX = 300;
+
+/**
+ * 本机内部错误（DB / fs / 解码…）→ 一行可读的日志素材。
+ *
+ * 为什么需要它：以前这类错误只留一个 code —— 附件那条路径连 code 都没有，一律 `send_failed`，
+ * `no such table: asset_uploads` 这种一眼定位的 message 被彻底吃掉，线上只能看着
+ * 每 30s 一次的重投猜。现在 code 与 message 都留，并压成一行、截断到 300 字。
+ *
+ * 纪律不变：这里只描述**错误**，永远不要把用户正文或凭据塞进来。
+ */
+export function describeInternalError(error: unknown, maxChars = INTERNAL_ERROR_DETAIL_MAX): string {
+  if (error instanceof Error) {
+    const raw = (error as Error & { code?: unknown }).code;
+    const code = typeof raw === 'string' && raw.length > 0 ? raw : null;
+    const message = flatten(error.message, maxChars);
+    if (message.length === 0) return code ?? error.name;
+    return code === null ? message : `${code}: ${message}`;
+  }
+  return flatten(String(error), maxChars);
+}
+
+function flatten(text: string, maxChars: number): string {
+  const oneLine = text.replace(/\s+/g, ' ').trim();
+  return oneLine.length <= maxChars ? oneLine : `${oneLine.slice(0, maxChars)}…`;
+}

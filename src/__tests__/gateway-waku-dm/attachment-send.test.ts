@@ -17,7 +17,12 @@ import {
   createSessionCredentialProvider,
   type BridgeTokenProvider,
 } from '../../gateway/channels/waku-dm/credential-provider.js';
-import { ASSET_CACHE_TTL_MS } from '../../gateway/channels/waku-dm/attachment-sender.js';
+import {
+  ASSET_CACHE_TTL_MS,
+  internalFailureCode,
+  type AssetUploadCache,
+} from '../../gateway/channels/waku-dm/attachment-sender.js';
+import { describeInternalError } from '../../gateway/log.js';
 import { readImageDimensions, type AvProbe, type MediaProbe } from '../../gateway/channels/waku-dm/media-probe.js';
 import type { OutboundEnvelope } from '../../gateway/core/delivery.js';
 import type { OutboundAttachment } from '../../gateway/core/attachments.js';
@@ -101,7 +106,14 @@ afterEach(async () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-function makeAdapter(overrides: { tokens?: BridgeTokenProvider; transcodeVideo?: boolean; maxUploadBytes?: number } = {}): WakuDmAdapter {
+function makeAdapter(
+  overrides: {
+    tokens?: BridgeTokenProvider;
+    transcodeVideo?: boolean;
+    maxUploadBytes?: number;
+    cache?: AssetUploadCache;
+  } = {},
+): WakuDmAdapter {
   const tokens = overrides.tokens ?? provider;
   const chat = createWakuChatClient({ apiBase: server.apiBase, tokens });
   const adapter = createWakuDmAdapter({
@@ -116,7 +128,7 @@ function makeAdapter(overrides: { tokens?: BridgeTokenProvider; transcodeVideo?:
     slowAckMs: 0,
     attachments: {
       probe,
-      cache: {
+      cache: overrides.cache ?? {
         get: (key) => store.getAssetUpload(key, Date.now(), ASSET_CACHE_TTL_MS),
         set: (key, assetId) => store.transaction((tx) => tx.saveAssetUpload(key, assetId, Date.now())),
       },
@@ -336,6 +348,93 @@ describe('waku-dm · 出站附件', () => {
     probe = stubProbe();
     await makeAdapter({ transcodeVideo: true }).send(finalWith([{ kind: 'video', path: file }], '', '0198f4c1-1111-7000-8000-000000000003'));
     expect(probe.transcodeCalls).toBe(1);
+  });
+});
+
+describe('waku-dm · 本机内部错误不许被吞成 send_failed', () => {
+  /** 线上真实形态：老库没跑到建 asset_uploads 的 migration，缓存查询当场抛 sqlite 错误。 */
+  function throwingCache(error: unknown): AssetUploadCache {
+    return {
+      get: () => {
+        throw error;
+      },
+      set: () => undefined,
+    };
+  }
+
+  it('缓存查询自己炸了 → 日志留下原始 message，code 带上错误标签（不再只剩 send_failed）', async () => {
+    const adapter = makeAdapter({ cache: throwingCache(new Error('no such table: asset_uploads')) });
+    const file = writeFile('a.png', pngOf(2, 3));
+
+    const receipt = await adapter.send(finalWith([{ kind: 'image', path: file }], '看这个'));
+
+    expect(receipt).toEqual({ status: 'unknown', code: 'attachment_internal:Error' });
+    // 上传都没走到：这不是"平台拒了"，是我们自己炸了
+    expect(server.uploads).toHaveLength(0);
+    // 附件层记一行原始错误
+    expect(log.find(/attachment internal error: no such table: asset_uploads/)).toHaveLength(1);
+    // 适配层那行也不能再只剩一个 code —— 运维只看得到这一行
+    const adapterLine = log.find(/send failed .*attachment=1\/1 \(image\)/);
+    expect(adapterLine).toHaveLength(1);
+    expect(adapterLine[0]).toContain('attachment_internal:Error');
+    expect(adapterLine[0]).toContain('no such table: asset_uploads');
+  });
+
+  it('带 code 的内部错误用 code 当标签（sqlite 的 name 一律是 Error，认不出东西）', async () => {
+    const sqliteish = Object.assign(new Error('no such table: asset_uploads'), { code: 'ERR_SQLITE_ERROR' });
+    const adapter = makeAdapter({ cache: throwingCache(sqliteish) });
+    const file = writeFile('a.png', pngOf(2, 3));
+
+    const receipt = await adapter.send(finalWith([{ kind: 'image', path: file }], '看这个'));
+
+    expect(receipt).toEqual({ status: 'unknown', code: 'attachment_internal:ERR_SQLITE_ERROR' });
+    expect(log.find(/no such table: asset_uploads/).length).toBeGreaterThan(0);
+  });
+
+  it('message 截断到 300 字：留证据，但别把一整篇 stack 灌进日志', async () => {
+    const adapter = makeAdapter({ cache: throwingCache(new Error('y'.repeat(1000))) });
+    const file = writeFile('a.png', pngOf(2, 3));
+
+    await adapter.send(finalWith([{ kind: 'image', path: file }], '看这个'));
+
+    const line = log.find(/attachment internal error/)[0];
+    expect(line).toContain('y'.repeat(300));
+    expect(line).not.toContain('y'.repeat(301));
+    expect(line).toContain('…');
+  });
+
+  it('平台自己的错误照旧按 HTTP 语义分类，不被内部错误这条路改掉', async () => {
+    const adapter = makeAdapter();
+    const file = writeFile('a.png', pngOf(2, 3));
+
+    server.failNextUpload({ status: 415, code: 'unsupported_media_type' });
+    expect(await adapter.send(finalWith([{ kind: 'image', path: file }], 'x'))).toEqual({
+      status: 'permanent-failure',
+      code: 'unsupported_media_type',
+    });
+  });
+});
+
+describe('waku-dm · 内部错误描述', () => {
+  it('code 与 message 都留；非 Error 也不炸', () => {
+    expect(describeInternalError(new Error('boom'))).toBe('boom');
+    expect(describeInternalError(Object.assign(new Error('boom'), { code: 'ERR_X' }))).toBe('ERR_X: boom');
+    expect(describeInternalError(new Error(''))).toBe('Error');
+    expect(describeInternalError('plain string')).toBe('plain string');
+    expect(describeInternalError(undefined)).toBe('undefined');
+    expect(describeInternalError(new Error('z'.repeat(400)))).toBe(`${'z'.repeat(300)}…`);
+  });
+
+  it('回执 code 的标签只留安全字符，且不会长到污染日志', () => {
+    expect(internalFailureCode(new Error('x'))).toBe('attachment_internal:Error');
+    expect(internalFailureCode(Object.assign(new Error('x'), { code: 'ERR_SQLITE_ERROR' }))).toBe(
+      'attachment_internal:ERR_SQLITE_ERROR',
+    );
+    expect(internalFailureCode('nope')).toBe('attachment_internal:string');
+    expect(internalFailureCode(Object.assign(new Error('x'), { code: 'a b/c\nd' }))).toBe('attachment_internal:a_b_c_d');
+    expect(internalFailureCode(Object.assign(new Error('x'), { code: 'E'.repeat(200) })).length).toBeLessThanOrEqual(
+      'attachment_internal:'.length + 48,
+    );
   });
 });
 
