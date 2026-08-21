@@ -14,6 +14,10 @@
 //   1. daemon 已起（bridge 模式：WAKU_GATEWAY_CHANNEL=waku-dm + BRIDGE_CREDENTIAL_FILE），/health 绿；
 //   2. owner 的 ~/.config/waku/auth.json 已登录（`waku login`），且 owner 与马甲互相关注；
 //   3. **本机与 daemon 那台机器都要有 ffmpeg**（这条金线验的就是 ffmpeg 那条链）。
+//      注意只要求 ffmpeg 本体，**不要求 drawtext/libfreetype**：暗号是先渲成 PNG 再 `-loop 1` 合进视频的，
+//      渲染走 scripts/lib/nonce-image.mjs 的三级降级（brew 的 ffmpeg 普遍没编 libfreetype，
+//      本机 8.1 实测 `-filters | grep drawtext` 为 0；把金线钉死在一个可选编译开关上，
+//      等于让环境缺件事就把整条链路判死）。
 // 参数（环境变量）：
 //   PERSONA_USER_ID     必填：马甲的 user_id
 //   WAKU_API_BASE       可选：v1 base，默认 auth.json 的 api_base
@@ -25,6 +29,8 @@ import { readFileSync, writeFileSync, renameSync, chmodSync, unlinkSync, existsS
 import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
+// 暗号字符集与三级降级渲染与图片金线同源（scripts/lib/nonce-image.mjs），一处修好两处受益。
+import { makeNonce, normalizeReply, renderNonceImage, tryRun } from './lib/nonce-image.mjs';
 
 const PERSONA = process.env.PERSONA_USER_ID;
 if (!PERSONA) {
@@ -83,38 +89,9 @@ async function api(method, route, body) {
 }
 
 // ── 测试视频：暗号烧进画面 ────────────────────────────────────
-// 字符集与图片金线同源：剔掉所有成对易混字形（0/O/D、1/I/l/J、2/Z、5/S、6/G、8/B、U/V），
-// 第 1 轮失败就一定是"没看见"，而不是"看花了"。
-const NONCE_ALPHABET = '3479ACEHKMNPRTWXY';
-const NONCE_LENGTH = 6;
+// 暗号字符集、三级降级渲染、回复归一化都在 scripts/lib/nonce-image.mjs，与图片金线同源。
 
-function makeNonce() {
-  let out = '';
-  for (let i = 0; i < NONCE_LENGTH; i += 1) out += NONCE_ALPHABET[Math.floor(Math.random() * NONCE_ALPHABET.length)];
-  return out;
-}
-
-const normalizeReply = (s) => String(s ?? '').toUpperCase().replace(/[^0-9A-Z]/g, '');
-
-const FONT_CANDIDATES = [
-  '/System/Library/Fonts/Supplemental/Arial Bold.ttf',
-  '/System/Library/Fonts/Supplemental/Arial.ttf',
-  '/System/Library/Fonts/Helvetica.ttc',
-  '/Library/Fonts/Arial.ttf',
-  '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
-  '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf',
-  '/usr/share/fonts/TTF/DejaVuSans-Bold.ttf',
-];
-const systemFont = () => FONT_CANDIDATES.find((p) => existsSync(p)) || null;
-
-function run(cmd, args) {
-  try {
-    execFileSync(cmd, args, { stdio: ['ignore', 'ignore', 'pipe'], timeout: 120_000 });
-    return true;
-  } catch {
-    return false;
-  }
-}
+const run = (cmd, args) => tryRun(cmd, args, 120_000);
 
 function ffprobeJson(file) {
   const out = execFileSync('ffprobe', ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', file], {
@@ -125,45 +102,46 @@ function ffprobeJson(file) {
 }
 
 /**
- * 3 秒 720p `testsrc`，中央压一行大号暗号。
+ * 3 秒 720p h264，整屏就是那张暗号图。
  *
- * 为什么用 testsrc 而不是纯色底：彩条 + 秒计数器让"模型到底看没看见画面"有第二重佐证——
- * 它要是编，编不出这套图形。drawtext 需要 libfreetype，很多 brew ffmpeg 没编；
- * 缺了就退回 `-vf drawbox` 画不出字 ⇒ 这条金线的第 1 轮就没意义，所以此时直接退出并说清原因。
+ * 为什么不用 `drawtext`：它要 libfreetype，而 brew 的 ffmpeg 普遍没编（本机 8.1 实测缺）。
+ * 一旦缺，这条金线在第 0 步就死，而它本来要验的是 daemon 的抽帧 / 转码 / 封面——
+ * **渲染器可用性是环境属性、不是被测对象**，不该有权把整条链路判死。
+ * 所以改成：先让图片金线那套三级降级渲染器产一张暗号 PNG，再 `-loop 1` 把它合成视频。
+ * 于是这里对 ffmpeg 的要求退回到"能 encode h264"这一条最基本的能力。
+ *
+ * 输出固定 1280x720（两边都是偶数——yuv420p 的色度二次采样要求边长可被 2 整除，
+ * 奇数边会让 libx264 直接报错）：`force_original_aspect_ratio=decrease` 先把 PNG 等比缩放到
+ * 框内最大，再 `pad` 白底居中补齐，无论渲染器产出多大的图，出来的都是同一个合规画布。
  */
 function makeNonceVideo(nonce, outPath) {
-  const font = systemFont();
-  if (font === null) {
-    console.error('no usable system font found — cannot burn the nonce into the video');
-    process.exit(2);
-  }
-  const drawtext = [
-    `fontfile=${font.replace(/[\\:]/g, '\\$&')}`,
-    `text=${nonce}`,
-    'fontcolor=black',
-    'fontsize=180',
-    'box=1',
-    'boxcolor=white@1.0',
-    'boxborderw=40',
-    'x=(w-text_w)/2',
-    'y=(h-text_h)/2',
-  ].join(':');
+  const pngPath = outPath.replace(/\.mp4$/, '.png');
+  const rendered = renderNonceImage(nonce, pngPath);
   const ok = run('ffmpeg', [
     '-y', '-loglevel', 'error',
-    '-f', 'lavfi', '-i', 'testsrc=size=1280x720:rate=15:duration=3',
-    '-vf', `drawtext=${drawtext}`,
+    '-loop', '1', '-i', pngPath,
+    '-t', '3', '-r', '30',
+    '-vf', 'scale=w=1280:h=720:force_original_aspect_ratio=decrease:flags=lanczos,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=white',
     '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p',
+    // 每秒一个关键帧：静止画面的 GOP 会拉得很长，而对面要按时间戳抽封面帧。
+    '-g', '30',
     '-movflags', '+faststart',
     outPath,
   ]);
+  try {
+    unlinkSync(pngPath);
+  } catch {
+    /* 渲染中间产物，删不掉也不影响判定 */
+  }
   if (!ok || !existsSync(outPath) || statSync(outPath).size === 0) {
-    console.error('ffmpeg could not render the nonce video (is drawtext/libfreetype compiled in?)');
-    console.error('  try: ffmpeg -filters | grep drawtext');
+    console.error('ffmpeg could not encode the nonce video (can this ffmpeg do libx264?)');
+    console.error('  try: ffmpeg -hide_banner -encoders | grep libx264');
     process.exit(2);
   }
   const probe = ffprobeJson(outPath);
   const v = (probe.streams || []).find((s) => s.codec_type === 'video') || {};
   return {
+    renderer: rendered.renderer,
     bytes: statSync(outPath).size,
     width: Number(v.width) || 0,
     height: Number(v.height) || 0,
@@ -233,7 +211,13 @@ async function waitForReply(afterSeq, predicate, label) {
 const nonce = makeNonce();
 const videoPath = path.join(os.tmpdir(), `waku-golden-${nonce}.mp4`);
 const meta = makeNonceVideo(nonce, videoPath);
-log(`2. turn #1 video nonce=${nonce} ${meta.width}x${meta.height} ${meta.durationMs}ms bytes=${meta.bytes} …`);
+log(
+  `2. turn #1 video nonce=${nonce} renderer=${meta.renderer} ` +
+    `${meta.width}x${meta.height} ${meta.durationMs}ms bytes=${meta.bytes} …`,
+);
+if (meta.renderer === 'bitmap') {
+  log('   (no ffmpeg/drawtext and no ImageMagick on this box — fell back to the built-in bitmap font)');
+}
 
 const assetId = await uploadAsset(videoPath, 'video/mp4');
 const seq1 = await sendVideo(assetId, meta);
