@@ -12,6 +12,11 @@
  *   不自动重跑"可能已经改过代码"的任务。
  * - chunk assembly 到期即 fail-closed：块齐了也不产出，并原子清理。
  * - 用 `node:sqlite`（Node 内置）而不是 better-sqlite3：不给这个仓加原生依赖。
+ *
+ * ⚠️ 头号不变量：**已发布的 migration 不可再改，只能追加新版本。**
+ *   `migrate()` 只跑 `version > PRAGMA user_version`，往旧版本里补 DDL 对**所有已存在的库**
+ *   都是死代码，而全新库（测试库全是）会一次性跑到最新版本、恰好把它带上 ⇒ 测试全绿、线上全炸。
+ *   细节与事故见下方 `MIGRATIONS` 的注释；机器守卫见 `migrations.lock.json`。
  */
 import fs from 'node:fs';
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
@@ -239,8 +244,18 @@ export interface OpenGatewayStoreOptions {
 /**
  * `PRAGMA user_version` 是唯一的版本键。每条 migration 只前进一级，
  * 库里已经是 v1（手工建的 endpoints 表）时只补跑 v2，不重建、不清数据。
+ *
+ * ⚠️ 不变量：**已发布的 migration 不可再改，只能追加新版本。**
+ *
+ * `migrate()` 只执行 `version > PRAGMA user_version` 的条目，所以往一条已经在别人库里
+ * 跑过的 migration 里加 DDL，等于给那些库写了一段永远不会执行的代码——而且**测试发现不了**：
+ * 测试库都是新建的，新建库一次性跑到最新版本，恰好把新加的 DDL 也带上了。
+ * 真实事故：PR #5 把 `asset_uploads` 加进 v2，所有 v2 老库上的出站附件从此 100% 失败。
+ *
+ * 这条不变量由 `migrations.lock.json` + `sqlite-store.test.ts` 的 hash 快照机器守着：
+ * 改动已发布版本的 SQL 会当场变红；新增版本要显式登记进 lock 才算数。
  */
-const MIGRATIONS: ReadonlyArray<{ version: number; sql: string }> = [
+export const MIGRATIONS: ReadonlyArray<{ version: number; sql: string }> = [
   {
     version: 1,
     sql: `
@@ -323,16 +338,6 @@ const MIGRATIONS: ReadonlyArray<{ version: number; sql: string }> = [
         external_delivery_id TEXT
       );
 
-      -- 出站附件的上传结果缓存。存在的唯一理由：**重投不要重复上传**。
-      -- 上传成功但 sendMessage 失败时，outbox 行会被原样重投；没有这张表的话，
-      -- 一个 80 MB 的视频会被重新传一遍（用户流量 + 平台配额都白烧）。
-      -- key = 路径 + 大小 + mtime：同一个文件没动过就复用同一枚 asset。
-      CREATE TABLE IF NOT EXISTS asset_uploads (
-        cache_key TEXT PRIMARY KEY,
-        asset_id TEXT NOT NULL,
-        created_at INTEGER NOT NULL
-      );
-
       CREATE TABLE IF NOT EXISTS conversations (
         id TEXT PRIMARY KEY,
         pairing_id TEXT NOT NULL,
@@ -380,6 +385,25 @@ const MIGRATIONS: ReadonlyArray<{ version: number; sql: string }> = [
       CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox_records (status, created_at);
       CREATE INDEX IF NOT EXISTS idx_turns_status ON turns (status);
       CREATE INDEX IF NOT EXISTS idx_pairings_route ON pairings (route_id);
+    `,
+  },
+  {
+    version: 3,
+    sql: `
+      -- 出站附件的上传结果缓存。存在的唯一理由：**重投不要重复上传**。
+      -- 上传成功但 sendMessage 失败时，outbox 行会被原样重投；没有这张表的话，
+      -- 一个 80 MB 的视频会被重新传一遍（用户流量 + 平台配额都白烧）。
+      -- key = 路径 + 大小 + mtime：同一个文件没动过就复用同一枚 asset。
+      --
+      -- 这张表本来被写在 v2 里（PR #5）。任何在那之前建好的库都停在 user_version=2，
+      -- migrate() 只跑 version > current，于是它永远不会被建出来——出站附件在老库上
+      -- 100% 失败（no such table: asset_uploads），而全新库因为一次性跑到最新版本
+      -- 恰好是好的，测试也就全绿。新表只能是新版本。
+      CREATE TABLE IF NOT EXISTS asset_uploads (
+        cache_key TEXT PRIMARY KEY,
+        asset_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
     `,
   },
 ];

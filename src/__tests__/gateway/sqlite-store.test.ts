@@ -18,7 +18,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 
 // ---------------------------------------------------------------------------
 // 测试侧契约
@@ -120,6 +121,7 @@ type GatewayTransaction = {
   }): void;
   insertInboxReceipt(r: ReceiptRow): 'inserted' | 'duplicate';
   commitCursor(collection: string, cursor: CursorRow): void;
+  saveAssetUpload(cacheKey: string, assetId: string, createdAt: number): void;
   insertOutbox(o: Omit<OutboxRow, 'status' | 'attempts' | 'externalDeliveryId'>): 'inserted' | 'duplicate';
   markOutboxSent(messageId: string, externalDeliveryId: string, sentAt: number): void;
   saveConversation(c: ConversationRow): void;
@@ -138,6 +140,7 @@ type GatewayStoreApi = {
   getPairingSecret(id: string): Uint8Array | null;
   getReceipt(pairingId: string, messageId: string): ReceiptRow | null;
   getCursor(collection: string): CursorRow | null;
+  getAssetUpload(cacheKey: string, now: number, maxAgeMs: number): string | null;
   getOutbox(messageId: string): OutboxRow | null;
   listPendingOutbox(): OutboxRow[];
   getConversation(id: string): ConversationRow | null;
@@ -155,6 +158,8 @@ type GatewayStoreApi = {
 
 type SqliteStoreModule = {
   openGatewayStore(options: { dbPath: string; masterKeyPath: string }): GatewayStoreApi;
+  readonly GATEWAY_SCHEMA_VERSION: number;
+  readonly MIGRATIONS: ReadonlyArray<{ version: number; sql: string }>;
 };
 
 type CredentialStoreApi = {
@@ -229,6 +234,50 @@ function hex(bytes: Uint8Array): string {
 
 function mode(file: string): number {
   return fs.statSync(file).mode & 0o777;
+}
+
+/** 直接读文件里的 `PRAGMA user_version`：store.schemaVersion 是编译期常量，证明不了库真的迁过。 */
+function dbUserVersion(file: string): number {
+  const db = new DatabaseSync(file);
+  try {
+    return Number((db.prepare('PRAGMA user_version').get() as Record<string, unknown>)['user_version']);
+  } finally {
+    db.close();
+  }
+}
+
+function hasTable(file: string, name: string): boolean {
+  const db = new DatabaseSync(file);
+  try {
+    return db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== undefined;
+  } finally {
+    db.close();
+  }
+}
+
+async function schemaVersion(): Promise<number> {
+  return (await loadStore()).GATEWAY_SCHEMA_VERSION;
+}
+
+/**
+ * 只保留 DDL 语义再 hash：去掉 `--` 注释、空白归一。
+ * 改缩进 / 改注释不该红（那不改变任何库的形状），改一个字的 DDL 必须红。
+ */
+function sha256OfSql(sql: string): string {
+  const normalized = sql
+    .split('\n')
+    .map((line) => line.replace(/--.*$/, ''))
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return createHash('sha256').update(normalized).digest('hex');
+}
+
+type MigrationLock = { migrations: Array<{ version: number; sha256: string }> };
+
+function readMigrationLock(): MigrationLock {
+  const file = fileURLToPath(new URL('../../gateway/state/migrations.lock.json', import.meta.url));
+  return JSON.parse(fs.readFileSync(file, 'utf8')) as MigrationLock;
 }
 
 function captureThrow(fn: () => unknown): GatewayError {
@@ -333,6 +382,139 @@ describe('M1 · schema 与 migration', () => {
     const again = await openStore();
     expect(again.getEndpoint('aster-admin')).toEqual(ADMIN_ENDPOINT);
     expect(again.getCursor('agent_inbox_v1')?.lastMessageId).toBe('m-1');
+  });
+
+  it('已经在 v2 的老库能补出 asset_uploads —— 新表必须走新版本，不能塞回已发布的 migration', async () => {
+    // 冻结的 v2 fixture：asset_uploads 被塞进 v2 之前，线上库真实长的样子。
+    // 故意**不**从 MIGRATIONS 派生 —— 用 MIGRATIONS 造 fixture 的话，
+    // "把 DDL 写回旧版本"这个 bug 会连 fixture 一起自愈，测试永远绿。
+    // 只造断言用得到的那几张表：v2 之后的 migration 不会回头补 v2 的表，
+    // 这正是本 case 要钉的语义（老库缺的东西只能由新版本补）。
+    const db = new DatabaseSync(dbPath);
+    db.exec(`
+      CREATE TABLE endpoints (
+        id TEXT PRIMARY KEY,
+        runner_profile_id TEXT NOT NULL,
+        workspace_policy_id TEXT NOT NULL,
+        trust_tier TEXT NOT NULL,
+        status TEXT NOT NULL
+      );
+
+      CREATE TABLE mailbox_cursors (
+        collection TEXT PRIMARY KEY,
+        last_created_at INTEGER NOT NULL,
+        last_message_id TEXT NOT NULL
+      );
+
+      CREATE TABLE outbox_records (
+        message_id TEXT PRIMARY KEY,
+        pairing_id TEXT NOT NULL,
+        route_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        status TEXT NOT NULL,
+        attempts INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        sent_at INTEGER,
+        external_delivery_id TEXT
+      );
+
+      INSERT INTO endpoints (id, runner_profile_id, workspace_policy_id, trust_tier, status)
+      VALUES ('aster-admin', 'local-729a', 'admin-home', 'admin-bypass', 'active');
+      INSERT INTO mailbox_cursors (collection, last_created_at, last_message_id)
+      VALUES ('agent_inbox_v1', 1, 'm-old');
+
+      PRAGMA user_version = 2;
+    `);
+    db.close();
+    expect(hasTable(dbPath, 'asset_uploads')).toBe(false);
+
+    const store = await openStore();
+
+    // 出站附件上传前的那次缓存查询：老库上它抛 `no such table: asset_uploads`，
+    // 于是每 30s 重投一次、永远失败。补出来之后它必须能读能写。
+    expect(store.getAssetUpload('k-1', NOW, 60_000)).toBeNull();
+    store.transaction((tx) => tx.saveAssetUpload('k-1', 'ast_1', NOW));
+    expect(store.getAssetUpload('k-1', NOW, 60_000)).toBe('ast_1');
+
+    // 老数据原样保留：这是补版本，不是重建库
+    expect(store.getEndpoint('aster-admin')).toEqual(ADMIN_ENDPOINT);
+    expect(store.getCursor('agent_inbox_v1')?.lastMessageId).toBe('m-old');
+    store.close();
+
+    const latest = await schemaVersion();
+    expect(dbUserVersion(dbPath)).toBe(latest);
+    expect(latest).toBeGreaterThanOrEqual(3);
+  });
+
+  it('被手工 CREATE TABLE 解围过的 v2 库也能收敛到 v3，不炸也不清数据', async () => {
+    // 线上真实存在的中间态：为了让 daemon 当场能发图，人手在 v2 库上补了这张表，
+    // 但 user_version 还停在 2。v3 用的是 IF NOT EXISTS ⇒ 补版本号即可，别把人家的数据推平。
+    const db = new DatabaseSync(dbPath);
+    db.exec(`
+      CREATE TABLE endpoints (
+        id TEXT PRIMARY KEY,
+        runner_profile_id TEXT NOT NULL,
+        workspace_policy_id TEXT NOT NULL,
+        trust_tier TEXT NOT NULL,
+        status TEXT NOT NULL
+      );
+
+      CREATE TABLE asset_uploads (
+        cache_key TEXT PRIMARY KEY,
+        asset_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
+      INSERT INTO endpoints (id, runner_profile_id, workspace_policy_id, trust_tier, status)
+      VALUES ('aster-admin', 'local-729a', 'admin-home', 'admin-bypass', 'active');
+      INSERT INTO asset_uploads (cache_key, asset_id, created_at) VALUES ('k-hand', 'ast_hand', ${NOW});
+
+      PRAGMA user_version = 2;
+    `);
+    db.close();
+
+    const store = await openStore();
+    expect(store.getAssetUpload('k-hand', NOW, 60_000)).toBe('ast_hand'); // 手工期的缓存没被推平
+    expect(store.getEndpoint('aster-admin')).toEqual(ADMIN_ENDPOINT);
+    store.close();
+
+    expect(dbUserVersion(dbPath)).toBe(await schemaVersion());
+  });
+
+  it('全新库一次建到最新版本，asset_uploads 当场可用', async () => {
+    const store = await openStore();
+    store.transaction((tx) => tx.saveAssetUpload('k-new', 'ast_new', NOW));
+    expect(store.getAssetUpload('k-new', NOW, 60_000)).toBe('ast_new');
+    const latest = await schemaVersion();
+    expect(store.schemaVersion).toBe(latest);
+    store.close();
+
+    expect(dbUserVersion(dbPath)).toBe(latest);
+    expect(hasTable(dbPath, 'asset_uploads')).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe('migration 不可变性契约', () => {
+  it('已发布的 migration 的 SQL 一个字都不许改（改了就改 lock 文件，那会被人看见）', async () => {
+    const mod = await loadStore();
+    const actual = Object.fromEntries(mod.MIGRATIONS.map((m) => [String(m.version), sha256OfSql(m.sql)]));
+    const locked = Object.fromEntries(readMigrationLock().migrations.map((m) => [String(m.version), m.sha256]));
+
+    // 两个方向都要红：
+    // - 旧版本 hash 变了 = 有人把 DDL 写回了已发布的 migration（老库永远跑不到，PR #5 就是这么炸的）
+    // - 出现 lock 里没有的版本 = 追加了新 migration，把它登记进 lock 才算数
+    expect(actual).toEqual(locked);
+  });
+
+  it('版本严格递增，且 GATEWAY_SCHEMA_VERSION 就是最后一条', async () => {
+    const mod = await loadStore();
+    const versions = mod.MIGRATIONS.map((m) => m.version);
+    expect(versions).toEqual([...versions].sort((a, b) => a - b));
+    expect(new Set(versions).size).toBe(versions.length);
+    expect(mod.GATEWAY_SCHEMA_VERSION).toBe(versions[versions.length - 1]);
   });
 });
 
