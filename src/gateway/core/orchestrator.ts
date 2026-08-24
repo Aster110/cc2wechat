@@ -107,6 +107,11 @@ export interface RunningTurnSummary {
   pairingId: string;
   routeId: string;
   keyVersion: number;
+  /**
+   * 触发这一轮的**入站** messageId。回环回复口据它把 `replyTo` 填成真正的那条消息，
+   * 通道侧的慢回执才认得出"这一轮已经给用户看过东西了"（见 `bootstrap/waku-dm.ts` 的 reply）。
+   */
+  messageId: string;
 }
 
 export interface GatewayOrchestrator extends TurnDispatcher {
@@ -522,6 +527,7 @@ export function createGatewayOrchestrator(
           pairingId: running.job.pairingId,
           routeId: running.job.routeId,
           keyVersion: running.job.keyVersion,
+          messageId: running.job.messageId,
         });
       }
       return out;

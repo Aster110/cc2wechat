@@ -105,7 +105,13 @@ export interface DmGatewayConfig {
   flushIntervalMs: number;
   heartbeatIntervalMs: number;
   sseIdleTimeoutMs: number;
-  /** 0 = 关闭慢回执。来自 `CC2WECHAT_ACK_MS`（沿用 v6）。 */
+  /**
+   * 0 = 关闭慢回执。`WAKU_DM_ACK_MS` 优先，回退 `CC2WECHAT_ACK_MS`（沿用 v6），再回退 60s。
+   *
+   * 为什么要有独立的一个：两个 daemon（微信 / waku-dm）跑在各自的进程里但共用 `CC2WECHAT_ACK_MS`
+   * 这一个名字，想只关其中一边就得靠"记得给这个 plist 也加一行"——实测正是这么漏的
+   * （微信侧 plist 设了 0，waku-dm 的没设，于是只有私聊还在发）。给它自己的名字，两边可独立调。
+   */
   slowAckMs: number;
   coldStartGraceMs: number;
   /** 入站媒体落盘目录（缺省 `<stateDir>/media`）与三道闸。 */
@@ -241,7 +247,11 @@ export function loadDmGatewayConfig(env: NodeJS.ProcessEnv = process.env): DmGat
     flushIntervalMs: readInt(env, 'FLUSH_INTERVAL_MS', DEFAULT_FLUSH_INTERVAL_MS),
     heartbeatIntervalMs: readInt(env, 'HEARTBEAT_INTERVAL_MS', WAKU_DM_HEARTBEAT_INTERVAL_MS),
     sseIdleTimeoutMs: readInt(env, 'SSE_IDLE_TIMEOUT_MS', SSE_IDLE_TIMEOUT_MS),
-    slowAckMs: readNonNegativeMs(env, 'CC2WECHAT_ACK_MS', WAKU_DM_SLOW_ACK_MS),
+    slowAckMs: readNonNegativeMs(
+      env,
+      'WAKU_DM_ACK_MS',
+      readNonNegativeMs(env, 'CC2WECHAT_ACK_MS', WAKU_DM_SLOW_ACK_MS),
+    ),
     coldStartGraceMs: readInt(env, 'COLD_START_GRACE_MS', WAKU_DM_COLD_START_GRACE_MS),
     mediaDir: readEnv(env, 'MEDIA_DIR') ?? path.join(stateDir, 'media'),
     mediaImageMaxBytes: readInt(env, 'MEDIA_IMAGE_MAX_BYTES', WAKU_DM_IMAGE_MAX_BYTES),
@@ -595,7 +605,9 @@ export function buildWakuDmGateway(options: BuildDmOptions): WakuDmGateway {
         payload: {
           type: 'final',
           conversationId,
-          replyTo: 'loopback',
+          // 认得出是哪一轮，通道侧的慢回执才能撤（用户已经看到东西了，就别再补"正在处理"）。
+          // 没有在跑的 turn（显式 --conversation 主动发起）时退回哨兵值：那本来就不属于任何一轮。
+          replyTo: running?.messageId ?? 'loopback',
           text: parsed.text,
           ...(merged.length === 0 ? {} : { attachments: merged }),
         },

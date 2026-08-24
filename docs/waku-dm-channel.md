@@ -239,7 +239,8 @@ waku-dm-reply --conversation conv_01J… --video /tmp/demo.mp4 --text "跑起来
 | `WAKU_GATEWAY_HEARTBEAT_INTERVAL_MS` | bridge 心跳间隔 | `30000` |
 | `WAKU_GATEWAY_SSE_IDLE_TIMEOUT_MS` | 无字节判死阈值 | `30000` |
 | `WAKU_GATEWAY_COLD_START_GRACE_MS` | 冷启动丢弃多旧的回放 | `60000` |
-| `CC2WECHAT_ACK_MS` | 慢回执「收到，正在处理…」阈值，`0` 关闭 | `60000` |
+| `WAKU_DM_ACK_MS` | 慢回执「收到，正在处理（复杂任务可能要几分钟）…」阈值，`0` 关闭。**优先于** `CC2WECHAT_ACK_MS`，两个 daemon 可独立调 | `60000` |
+| `CC2WECHAT_ACK_MS` | 同一个旋钮，与微信通道共用；只有 `WAKU_DM_ACK_MS` 没设时才读它 | `60000` |
 | `WAKU_GATEWAY_MEDIA_DIR` | 入站媒体落盘根目录 | `<STATE_DIR>/media` |
 | `WAKU_GATEWAY_MEDIA_IMAGE_MAX_BYTES` | 入站图片体积上限 | `16777216`（16 MiB） |
 | `WAKU_GATEWAY_MEDIA_MAX_BYTES` | 入站视频 / 语音体积上限 | `104857600`（100 MiB） |

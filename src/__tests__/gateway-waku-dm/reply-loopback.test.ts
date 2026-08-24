@@ -19,7 +19,7 @@ import { buildWakuDmGateway, loadDmGatewayConfig, type WakuDmGateway } from '../
 import { createOpsServer, HEALTH_PORT_FILE, parseReplyBody } from '../../gateway/server.js';
 import { parseReplyArgs, postReply, resolveHealthPort } from '../../gateway/reply-cli.js';
 import { FakeAgent } from '../gateway-core/harness.js';
-import { FakeBridgeServer, RecordingLogger, waitFor } from './fake-bridge-server.js';
+import { FakeBridgeServer, RecordingLogger, waitFor, sleep } from './fake-bridge-server.js';
 
 const PERSONA = 'usr_persona_000000000000000000001';
 const OWNER = 'usr_8c8b6c0329f140cd8dc78dfcff7ddeec';
@@ -64,7 +64,7 @@ afterEach(async () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-async function boot(): Promise<WakuDmGateway> {
+async function boot(options: { ackMs?: string } = {}): Promise<WakuDmGateway> {
   const credentialFile = path.join(dir, 'bridge.credential');
   fs.writeFileSync(credentialFile, `${CREDENTIAL}\n`, { mode: 0o600 });
   const config = loadDmGatewayConfig({
@@ -75,7 +75,7 @@ async function boot(): Promise<WakuDmGateway> {
     WAKU_GATEWAY_API_BASE: server.apiBase,
     WAKU_GATEWAY_OWNER_USER_IDS: `${OWNER},${OWNER_B}`,
     WAKU_GATEWAY_SSE_IDLE_TIMEOUT_MS: '2000',
-    CC2WECHAT_ACK_MS: '0',
+    CC2WECHAT_ACK_MS: options.ackMs ?? '0',
   } as NodeJS.ProcessEnv);
   agent = new FakeAgent();
   gateway = buildWakuDmGateway({ config, agent, log: new RecordingLogger() });
@@ -139,6 +139,48 @@ describe('waku-dm · 回环回复：会话推断', () => {
     const gw = await boot();
     await startBlockedTurn(CONV);
     await expect(gw.reply({ text: '   ' })).rejects.toThrow(/nothing to send/);
+  });
+});
+
+describe('waku-dm · 回环回复与慢回执', () => {
+  /**
+   * 慢回执（「收到，正在处理…」）的前提是"用户到现在还什么都没收到"。Agent 中途用回环口
+   * 发过东西之后这个前提就不成立了，再补一句只会像机器人自言自语。
+   *
+   * 原先做不到，是因为回环发布把 `replyTo` 写死成哨兵 `'loopback'`，永远匹配不上真正的
+   * 入站 messageId ⇒ `cancelSlowAck` 全程是个空操作。
+   */
+  it('中途回环发过东西 → 这一轮不再补「正在处理」', async () => {
+    const gw = await boot({ ackMs: '200' });
+    await startBlockedTurn(CONV);
+
+    await gw.reply({ text: '先给你看个东西' });
+    await waitFor(() => server.messages.some((m) => m.body === '先给你看个东西'), { label: 'loopback delivered' });
+
+    await sleep(500);
+    expect(server.messages.filter((m) => m.body.includes('正在处理'))).toHaveLength(0);
+  });
+
+  it('对照：同样的慢轮，没有回环回复时慢回执照发（证明上一条不是因为压根没起计时）', async () => {
+    const gw = await boot({ ackMs: '200' });
+    void gw;
+    await startBlockedTurn(CONV);
+
+    await waitFor(() => server.messages.some((m) => m.body.includes('正在处理')), {
+      timeoutMs: 3_000,
+      label: 'slow ack fired',
+    });
+    expect(server.messages.filter((m) => m.body.includes('正在处理'))).toHaveLength(1);
+  });
+
+  it('慢回执只发一次：等两个阈值也不会冒出第二句', async () => {
+    const gw = await boot({ ackMs: '200' });
+    void gw;
+    await startBlockedTurn(CONV);
+
+    await waitFor(() => server.messages.some((m) => m.body.includes('正在处理')), { timeoutMs: 3_000 });
+    await sleep(600);
+    expect(server.messages.filter((m) => m.body.includes('正在处理'))).toHaveLength(1);
   });
 });
 

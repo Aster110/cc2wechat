@@ -92,6 +92,50 @@ describe('waku-dm · loadDmGatewayConfig', () => {
     expect(config.slowAckMs).toBe(0);
   });
 
+  describe('慢回执阈值：WAKU_DM_ACK_MS 优先于 CC2WECHAT_ACK_MS', () => {
+    /**
+     * 为什么要分家：两个 daemon 各跑各的进程，却共用 `CC2WECHAT_ACK_MS` 一个名字。实测漏法是
+     * 微信侧 plist 设了 `0`、waku-dm 的 plist 没设 ⇒ 只有私聊还在发"正在处理"。给 waku-dm
+     * 自己的名字，两边就能独立关 / 独立调，不再靠"记得两个 plist 都写"。
+     */
+    const base = (dir: string): NodeJS.ProcessEnv =>
+      ({
+        WAKU_GATEWAY_CHANNEL: 'waku-dm',
+        WAKU_GATEWAY_BRIDGE_CREDENTIAL_FILE: writeCredential(dir),
+        WAKU_GATEWAY_API_BASE: 'https://api.example/api/v1',
+        WAKU_GATEWAY_OWNER_USER_IDS: OWNER,
+        WAKU_GATEWAY_WORKSPACE_DIR: dir,
+      }) as NodeJS.ProcessEnv;
+
+    it('两个都设 → 用 WAKU_DM_ACK_MS', () => {
+      const dir = tmp();
+      const config = loadDmGatewayConfig({ ...base(dir), CC2WECHAT_ACK_MS: '60000', WAKU_DM_ACK_MS: '90000' });
+      expect(config.slowAckMs).toBe(90_000);
+    });
+
+    it('WAKU_DM_ACK_MS=0 关掉私聊慢回执，不影响微信侧的值', () => {
+      const dir = tmp();
+      const config = loadDmGatewayConfig({ ...base(dir), CC2WECHAT_ACK_MS: '60000', WAKU_DM_ACK_MS: '0' });
+      expect(config.slowAckMs).toBe(0);
+    });
+
+    it('只设 CC2WECHAT_ACK_MS → 仍然生效（老部署不回归）', () => {
+      const dir = tmp();
+      const config = loadDmGatewayConfig({ ...base(dir), CC2WECHAT_ACK_MS: '30000' });
+      expect(config.slowAckMs).toBe(30_000);
+    });
+
+    it('都不设 → 60s 默认（44620c6 定的那条：阈值太低会每条都触发）', () => {
+      const dir = tmp();
+      expect(loadDmGatewayConfig(base(dir)).slowAckMs).toBe(60_000);
+    });
+
+    it('WAKU_DM_ACK_MS 写坏了直接报错，不静默退回默认', () => {
+      const dir = tmp();
+      expect(() => loadDmGatewayConfig({ ...base(dir), WAKU_DM_ACK_MS: 'soon' })).toThrow(/WAKU_DM_ACK_MS/);
+    });
+  });
+
   it('session 模式：API_BASE 缺省从 auth.json 的 api_base 读', () => {
     const dir = tmp();
     const authPath = path.join(dir, 'auth.json');
