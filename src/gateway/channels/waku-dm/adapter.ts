@@ -53,7 +53,12 @@ export const WAKU_DM_UNSUPPORTED_KIND_NOTICE_MS = 60_000;
 const CLIENT_MSG_ID_MAX = 128;
 const SHUTDOWN_HEARTBEAT_TIMEOUT_MS = 2_000;
 
-export const DM_SLOW_ACK_TEXT = '收到，正在处理…';
+/**
+ * 慢回执文案。带上"可能要几分钟"是刻意的：私聊里**没有**逐会话的"正在输入"指示器
+ * （微信通道有 `startTypingHeartbeat`，这边只有一条用户看不见的 bridge 心跳），
+ * 这句话是用户在长任务里唯一能拿到的活着信号——只说"正在处理"会让人几十秒后再问一次。
+ */
+export const DM_SLOW_ACK_TEXT = '收到，正在处理（复杂任务可能要几分钟）…';
 export const DM_UNSUPPORTED_KIND_TEXT = '这类消息我还看不了，发文字 / 图片 / 视频 / 语音 / playable 卡片给我吧 🙏';
 
 // ---------------------------------------------------------------------------

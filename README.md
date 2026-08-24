@@ -271,7 +271,8 @@ node dist/gateway/server.js
 | `WAKU_GATEWAY_DEFAULT_TIER` | Tier for everyone else: `deny` (silent) or `chat-only`/`sandbox-workspace`/`repo-pr` (needs `WAKU_GATEWAY_GUEST_WORKSPACE_DIR`) | `deny` |
 | `WAKU_GATEWAY_STATE_DIR` / `HEALTH_PORT` | Own SQLite + loopback ops port (can run next to the V1 daemon) | `~/.waku-gateway-dm` / `18092` |
 | `WAKU_GATEWAY_HEARTBEAT_INTERVAL_MS` / `SSE_IDLE_TIMEOUT_MS` / `COLD_START_GRACE_MS` | Heartbeat cadence, SSE dead-connection threshold, how old a cold-start replay may be | `30000` / `30000` / `60000` |
-| `CC2WECHAT_ACK_MS` | Slow-turn notice (“收到，正在处理…”); `0` disables | `60000` |
+| `WAKU_DM_ACK_MS` | Slow-turn notice (“收到，正在处理（复杂任务可能要几分钟）…”); `0` disables. Takes precedence over `CC2WECHAT_ACK_MS`, so the DM daemon can be tuned independently of the WeChat one | `60000` |
+| `CC2WECHAT_ACK_MS` | Same knob, shared with the WeChat channel; used only when `WAKU_DM_ACK_MS` is unset | `60000` |
 | `WAKU_GATEWAY_MEDIA_DIR` / `MEDIA_TTL_MS` / `MEDIA_SWEEP_INTERVAL_MS` | Where inbound media lands, how long it lives, how often it is swept | `<state>/media` / `86400000` / `3600000` |
 | `WAKU_GATEWAY_MEDIA_IMAGE_MAX_BYTES` / `MEDIA_MAX_BYTES` / `MEDIA_TIMEOUT_MS` | Inbound size caps (image / video+voice) and per-download timeout | `16MiB` / `100MiB` / `60000` |
 | `WAKU_DM_VIDEO_TRANSCODE` / `WAKU_GATEWAY_MAX_VIDEO_SECONDS` / `WAKU_GATEWAY_MAX_UPLOAD_BYTES` | Transcode outbound video to ≤720p H.264 + AAC + faststart (needs ffmpeg; **on by default**, `0`/`false`/`off`/`no` disables, skipped when the source already conforms); truncation length; outbound per-file cap | **on** / `60` / `200MiB` |
