@@ -26,18 +26,18 @@ async function main(): Promise<void> {
       console.error(`File not found: ${filePath}`);
       process.exit(1);
     }
-    await uploadAndSendMedia({
+    const r = await uploadAndSendMedia({
       token: ctx.token,
       toUser: ctx.userId,
       contextToken: ctx.contextToken,
       filePath,
       baseUrl: ctx.baseUrl,
     });
-    console.log(`Sent: ${filePath}`);
+    console.log(`Sent: ${filePath}${r.messageId ? ` (message_id=${r.messageId})` : ''}`);
   } else if (args[0] === '--text') {
     const text = args.slice(1).join(' ');
-    await sendMessage(ctx.token, ctx.userId, text, ctx.contextToken, ctx.baseUrl);
-    console.log(`Sent: ${text.slice(0, 50)}...`);
+    const r = await sendMessage(ctx.token, ctx.userId, text, ctx.contextToken, ctx.baseUrl);
+    console.log(`Sent: ${text.slice(0, 50)}...${r.messageId ? ` (message_id=${r.messageId})` : ''}`);
   } else {
     console.log('Usage: cc2wechat-reply --image <path> | --text <message>');
   }

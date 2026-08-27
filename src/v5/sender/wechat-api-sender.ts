@@ -13,7 +13,12 @@ import {
   decodeAesKey,
   decryptAesEcb,
   encryptAesEcb,
+  extractMessageId,
+  type SendResult,
 } from '../shared/wechat-api-core.js';
+import { assertNoCdnError } from '../../v6/wechat/errcode.js';
+
+export type { SendResult };
 
 export async function sendMessage(
   token: string,
@@ -21,7 +26,7 @@ export async function sendMessage(
   text: string,
   contextToken: string,
   baseUrl?: string,
-): Promise<void> {
+): Promise<SendResult> {
   const body: SendMessageReq = {
     msg: {
       from_user_id: '',
@@ -33,7 +38,7 @@ export async function sendMessage(
       context_token: contextToken,
     },
   };
-  await apiFetch({
+  const raw = await apiFetch({
     baseUrl,
     endpoint: 'ilink/bot/sendmessage',
     body: JSON.stringify({ ...body, base_info: buildBaseInfo() }),
@@ -42,6 +47,7 @@ export async function sendMessage(
     label: 'sendMessage',
     failOnBodyError: true,
   });
+  return { messageId: extractMessageId(raw) };
 }
 
 export async function sendTyping(
@@ -86,7 +92,7 @@ export async function uploadAndSendMedia(params: {
   filePath: string;
   baseUrl?: string;
   cdnBaseUrl?: string;
-}): Promise<void> {
+}): Promise<SendResult> {
   const { token, toUser, contextToken, filePath, baseUrl, cdnBaseUrl } = params;
 
   const fileData = fs.readFileSync(filePath);
@@ -147,14 +153,17 @@ export async function uploadAndSendMedia(params: {
     });
     clearTimeout(timer);
 
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw new Error(`CDN upload failed: ${res.status} ${body}`);
-    }
+    // CDN 的 body 恒空,错在 x-error-code / x-error-message 两个响应头里。
+    // 而且它会 HTTP 200 + 头里带错误码,所以不能只看 res.ok。
+    const cdnBody = await res.text().catch(() => '');
+    assertNoCdnError('CDN upload', res, cdnBody);
 
     const downloadParam = res.headers.get('x-encrypted-param');
     if (!downloadParam) {
-      throw new Error('CDN upload did not return x-encrypted-param header');
+      throw new Error(
+        `CDN upload did not return x-encrypted-param header (HTTP ${res.status})` +
+        ' —— 没有这个头就没法把媒体挂进消息,别继续往下发。',
+      );
     }
 
     const aesKeyBase64 = Buffer.from(aeskey.toString('hex')).toString('base64');
@@ -194,7 +203,7 @@ export async function uploadAndSendMedia(params: {
       base_info: buildBaseInfo(),
     };
 
-    await apiFetch({
+    const raw = await apiFetch({
       baseUrl,
       endpoint: 'ilink/bot/sendmessage',
       body: JSON.stringify(msgBody),
@@ -203,6 +212,7 @@ export async function uploadAndSendMedia(params: {
       label: 'sendMediaMessage',
       failOnBodyError: true,
     });
+    return { messageId: extractMessageId(raw) };
   } catch (err) {
     clearTimeout(timer);
     throw err;
@@ -242,7 +252,7 @@ export async function downloadMedia(params: {
 
     if (!res.ok) {
       const body = await res.text().catch(() => '');
-      throw new Error(`CDN download failed: ${res.status} ${body}`);
+      assertNoCdnError('CDN download', res, body);
     }
 
     const encryptedData = Buffer.from(await res.arrayBuffer());

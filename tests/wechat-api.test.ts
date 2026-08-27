@@ -75,7 +75,8 @@ describe('sendMessage', () => {
 
   it('sends message successfully (no throw)', async () => {
     vi.stubGlobal('fetch', mockFetchText('{"ret":0}'));
-    await expect(sendMessage('tok', 'user1', 'hello', 'ctx1')).resolves.toBeUndefined();
+    // 现在回 SendResult；这个响应没带 message_id，所以 messageId 是 undefined
+    await expect(sendMessage('tok', 'user1', 'hello', 'ctx1')).resolves.toEqual({ messageId: undefined });
   });
 });
 

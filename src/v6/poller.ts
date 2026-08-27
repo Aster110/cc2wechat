@@ -121,8 +121,9 @@ export class MessageDispatcher {
     const conversationId = deriveConversationId(account.accountId, userId);
     store.noteUser?.(conversationId, userId);
 
-    const reply = (text: string): Promise<void> =>
-      sendMessage(account.token, userId, text, contextToken, account.baseUrl);
+    const reply = async (text: string): Promise<void> => {
+      await sendMessage(account.token, userId, text, contextToken, account.baseUrl);
+    };
 
     const mediaMap = await downloadMediaItems(msg, account);
     const text = extractText(msg, mediaMap);

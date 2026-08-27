@@ -74,6 +74,22 @@ export async function apiFetch(params: {
   }
 }
 
+/**
+ * 从原始响应文本里抠 message_id。
+ *
+ * **不能走 JSON.parse** —— message_id 是 int64(实测 7498796439671022216),
+ * 远超 Number.MAX_SAFE_INTEGER,parse 完尾数就变了,拿去对账对不上。
+ */
+export function extractMessageId(rawText: string): string | undefined {
+  const m = /"message_id"\s*:\s*"?(-?\d+)"?/.exec(rawText);
+  return m?.[1];
+}
+
+export interface SendResult {
+  /** 微信回的 message_id(int64,按字符串原样保留)。这是"真发出去了"的唯一凭据。 */
+  messageId?: string;
+}
+
 export function encryptAesEcb(plaintext: Buffer, key: Buffer): Buffer {
   const cipher = crypto.createCipheriv('aes-128-ecb', key, null);
   return Buffer.concat([cipher.update(plaintext), cipher.final()]);

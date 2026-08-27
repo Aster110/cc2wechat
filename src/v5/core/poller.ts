@@ -97,7 +97,7 @@ export async function processMessage(msg: WeixinMessage, deps: ProcessMessageDep
   const handled = await gateway.tryHandle({
     userId, contextToken, text,
     delivery,
-    reply: (t) => sendMessage(account.token, userId, t, contextToken, account.baseUrl),
+    reply: async (t) => { await sendMessage(account.token, userId, t, contextToken, account.baseUrl); },
     closeSession: (uid) => delivery.closeSession(uid),
     createNewSession: (uid) => delivery.createSession(uid, backend, cwd),
   });

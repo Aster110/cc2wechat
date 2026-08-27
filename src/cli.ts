@@ -172,18 +172,19 @@ async function reply(): Promise<void> {
       console.error(`File not found: ${filePath}`);
       process.exit(1);
     }
-    await uploadAndSendMedia({
+    const r = await uploadAndSendMedia({
       token: ctx.token,
       toUser: ctx.userId,
       contextToken: ctx.contextToken,
       filePath,
       baseUrl: ctx.baseUrl,
     });
-    console.log(`Sent: ${filePath}`);
+    // message_id 是唯一能证明"微信真收下了"的东西,别只打一句 Sent 就当交付
+    console.log(`Sent: ${filePath}${r.messageId ? ` (message_id=${r.messageId})` : ''}`);
   } else if (command === '--text') {
     const text = args.slice(1).join(' ');
-    await sendMessage(ctx.token, ctx.userId, text, ctx.contextToken, ctx.baseUrl);
-    console.log(`Sent: ${text.slice(0, 50)}...`);
+    const r = await sendMessage(ctx.token, ctx.userId, text, ctx.contextToken, ctx.baseUrl);
+    console.log(`Sent: ${text.slice(0, 50)}...${r.messageId ? ` (message_id=${r.messageId})` : ''}`);
   }
 }
 
