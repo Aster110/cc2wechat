@@ -64,6 +64,8 @@ export interface ClaudeAppAgentOptions {
   /** 网关不在线时愿意等多久让它重挂 */
   gatewayWaitMs?: number;
   turnTimeoutMs?: number;
+  /** 回程轮询的旋钮(轮询间隔 / settle 窗口 / 静默兜底 / 等引擎)。缺省用 watcher 自己的默认值。 */
+  watchTuning?: Partial<Pick<WatchOptions, 'pollMs' | 'settleMs' | 'silenceMs' | 'engineWaitMs'>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -113,6 +115,7 @@ export class ClaudeAppAgent implements AgentAdapter {
   private readonly newJobId: () => string;
   private readonly gatewayWaitMs: number;
   private readonly turnTimeoutMs: number;
+  private readonly watchTuning: Partial<Pick<WatchOptions, 'pollMs' | 'settleMs' | 'silenceMs' | 'engineWaitMs'>>;
   private readonly fallbackEnabled: boolean;
   private fallbackAgent: AgentAdapter | null;
 
@@ -127,6 +130,7 @@ export class ClaudeAppAgent implements AgentAdapter {
     this.newJobId = opts.newJobId ?? (() => randomUUID().replace(/-/g, '').slice(0, 12));
     this.gatewayWaitMs = opts.gatewayWaitMs ?? Number(this.env.CC2WECHAT_CLAUDE_APP_GATEWAY_WAIT_MS ?? 5_000);
     this.turnTimeoutMs = opts.turnTimeoutMs ?? Number(this.env.CC2WECHAT_CLAUDE_APP_TURN_TIMEOUT_MS ?? 180_000);
+    this.watchTuning = opts.watchTuning ?? {};
 
     // fallback 显式传 null = 不要降级;不传 = 懒造一个 codex
     this.fallbackEnabled =
@@ -230,6 +234,7 @@ export class ClaudeAppAgent implements AgentAdapter {
 
     const progress: string[] = [];
     const result = await this.watcher.watch({
+      ...this.watchTuning,
       cwd: inbox.cwd,
       marker: jobMarker(jobId),
       baseline,
