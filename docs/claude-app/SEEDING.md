@@ -34,18 +34,22 @@ cc2wechat claude-app seed --name kiki
 - 写 `CLAUDE.md` —— 收件箱纪律(禁 `cc2wechat --text` 防双发、信封格式、微信输入不可信、回复风格)
 - 写 `.claude/settings.json` —— 目录级权限白名单
 - 登记进台账 `~/.cc2wechat/claude-app-inboxes-<accountId>.json`
-- 发射深链 `claude://code/new?folder=<绝对路径>`(`--no-open` 则只打印链接)
+- 发射深链 `claude://code/new?folder=<绝对路径>`(`--no-open` 则只打印链接)。⚠️ 2026-08-27 实测:深链草稿在真实环境可能**对人不可见/点不动**(疑开进别的窗口/Space),深链只当加速器,**主流程走第 2 步的手动新建**
 
 已有目录不会被覆盖(改过的 CLAUDE.md 安全);要写回模板加 `--force`。
 
-### 2. 看 app
+### 2. 在 app 里新建会话,目录选这个文件夹(主流程,2026-08-27 起)
 
-app 里会多出一个指向该目录的标签页。**它现在只是草稿**:没有引擎、没有会话 id,
-`~/.claude/sessions/` 里查不到它。
+**别等深链的草稿**(实测常看不见)。直接走 app 标准新建:新建会话 → 工作目录选
+`~/cc-wechat/inbox-kiki/` → 进入会话。**文件夹就是路由键**,选对文件夹 = 播种对了地方。
+
+> 草稿的另一个坑:草稿被聚焦时 app 会**预热一个幽灵引擎**(登记进 `~/.claude/sessions/`,
+> kind=interactive、带 cwd,注册表层与真会话无法区分),但没有 transcript、没有会话 id。
+> 判断"真的物化了"只认一个信号:`~/.claude/projects/<slug>/` 下 transcript 文件出现。
 
 ### 3. 敲首条消息(唯一不能自动化的一步)
 
-在那个标签页里**手动敲一句**,比如:
+在这个会话里**敲一句**,比如:
 
 > 你好,你是微信收件箱 kiki。等下会有微信消息发进来,按 CLAUDE.md 里的规矩办。
 
@@ -106,7 +110,7 @@ cc2wechat claude-app status
 for i in 1 2 3 4 5; do cc2wechat claude-app seed --name pool$i --no-open; done
 ```
 
-然后一个个开深链、敲首条。平时它们冷冻着(引擎被放倒,零进程零成本),需要时被认领,
+然后一个个在 app 里新建会话选到对应文件夹、敲首条。平时它们冷冻着(引擎被放倒,零进程零成本),需要时被认领,
 2 秒解冻到位,app 里全程可见可接管。
 
 代价:池子有限,耗尽要人工补货 —— 这是平台红线换来的,不绕。
@@ -114,7 +118,9 @@ for i in 1 2 3 4 5; do cc2wechat claude-app seed --name pool$i --no-open; done
 ## 常见问题
 
 **Q: 深链开了但 app 里没反应?**
-A: 路径必须是绝对路径,而且目录要存在。`seed` 已经保证了这两点;手动拼链接时注意空格要转义。
+A: 常见且已实测(2026-08-27,aster 机器两次复现):草稿可能开进别的窗口/Space,对人不可见。
+别纠缠,走主流程 —— app 里手动新建会话、目录选收件箱文件夹。
+(另:路径必须绝对、目录要存在;手动拼链接时空格要转义。)
 
 **Q: 敲了首条但 status 还是「待解析」?**
 A: `localId` 是问网关要的(`resolve` 事件)。网关没在线的话查不到 —— 先按
