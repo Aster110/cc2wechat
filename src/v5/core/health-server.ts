@@ -67,6 +67,8 @@ export function startHealthServer(port: number, deps: HealthServerDeps): http.Se
     }
   });
 
-  server.listen(port);
+  // 只听 127.0.0.1（2026-08-27 对齐 v6）：v5 老行为 listen(port) 绑 0.0.0.0，
+  // 而 /close-session 无鉴权——公网口全靠云安全组挡是裸奔。健康检查/CLI 全在本机，回环够用。
+  server.listen(port, '127.0.0.1');
   return server;
 }
