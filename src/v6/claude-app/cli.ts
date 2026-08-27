@@ -94,6 +94,10 @@ export async function runClaudeAppCli(deps: ClaudeAppCliDeps): Promise<number> {
 
     out('');
     out(`  🦞 claude-app 后端状态 (port ${port})`);
+    // 台账文件名带 accountId。CLI 找不到账号时会退到 "default",
+    // 而 daemon 用的是真 accountId —— 两边对不上时,seed 出来的收件箱 daemon 看不见。
+    // 把路径打出来,这种错至少一眼能看出来。
+    out(`  台账: ${inboxes.filePath()}`);
     const report = runProbe({ registry, inboxes, busStats });
     out(formatProbe(report));
 

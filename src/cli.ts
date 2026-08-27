@@ -542,18 +542,22 @@ switch (command) {
   case 'claude-app': {
     // cc2wechat claude-app seed --name X / status [--port N]
     // 实现在 v6/claude-app/cli.ts（这里只分发，那边才测得动）
+    //
+    // 注意：上面那段全局 --name 预解析（为 login 服务）已经把 `--name X` 从 args 里剪掉了，
+    // 所以这里要把它还回去，否则 seed 永远看不到名字。
+    const subArgs = args.slice(1);
+    if (loginName && !subArgs.includes('--name')) subArgs.push('--name', loginName);
     const port = parseInt(process.env.CC2WECHAT_PORT ?? String(BASE_PORT), 10);
     const account = getActiveAccount(port);
     import('./v6/claude-app/cli.js')
-      .then(({ runClaudeAppCli }) =>
-        runClaudeAppCli({ argv: args.slice(1), port, accountId: account?.accountId }),
-      )
+      .then(({ runClaudeAppCli }) => runClaudeAppCli({ argv: subArgs, port, accountId: account?.accountId }))
+      // 用 exitCode 而不是 process.exit()：后者会在管道还没冲干净时就走人，输出会被截断
       .then((code) => {
-        if (code !== 0) process.exit(code);
+        process.exitCode = code;
       })
       .catch((err) => {
         console.error(String(err));
-        process.exit(1);
+        process.exitCode = 1;
       });
     break;
   }

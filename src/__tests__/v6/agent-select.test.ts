@@ -1,4 +1,8 @@
 import { describe, it, expect } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
 import { selectAgent } from '../../v6/agents/select.js';
 
 describe('selectAgent — env CC2WECHAT_BACKEND > config.backend', () => {
@@ -48,5 +52,41 @@ describe('selectAgent — env CC2WECHAT_BACKEND > config.backend', () => {
     const a = selectAgent({ CC2WECHAT_BACKEND: ' CODEX ' } as NodeJS.ProcessEnv);
     expect(a.name).toBe('codex');
     expect(a.persistent).toBe(true);
+  });
+});
+
+describe('selectAgent —— claude-app(Claude desktop app 会话后端)', () => {
+  // 台账文件会落到 dataDir;这里指到临时目录,别碰真实 ~/.cc2wechat
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-select-'));
+
+  it('CC2WECHAT_BACKEND=claude-app → ClaudeAppAgent(常驻)', () => {
+    const a = selectAgent({ CC2WECHAT_BACKEND: 'claude-app' } as NodeJS.ProcessEnv, {}, { dataDir });
+    expect(a.name).toBe('claude-app');
+    expect(a.persistent).toBe(true);
+  });
+
+  it('claude-desktop 是别名', () => {
+    expect(selectAgent({ CC2WECHAT_BACKEND: 'claude-desktop' } as NodeJS.ProcessEnv, {}, { dataDir }).name).toBe(
+      'claude-app',
+    );
+  });
+
+  it('config.backend 也认', () => {
+    expect(selectAgent({} as NodeJS.ProcessEnv, { backend: 'claude-app' }, { dataDir }).name).toBe('claude-app');
+  });
+
+  it('大小写/空格不敏感', () => {
+    expect(selectAgent({ CC2WECHAT_BACKEND: ' Claude-App ' } as NodeJS.ProcessEnv, {}, { dataDir }).name).toBe(
+      'claude-app',
+    );
+  });
+
+  it('不影响 claude-code —— "claude" 仍然是 SDK 池,不是 app 会话', () => {
+    expect(selectAgent({ CC2WECHAT_BACKEND: 'claude' } as NodeJS.ProcessEnv).name).toBe('claude-code');
+    expect(selectAgent({ CC2WECHAT_BACKEND: 'claude-code' } as NodeJS.ProcessEnv).name).toBe('claude-code');
+  });
+
+  it('第三个参数(accountId/dataDir)不给也不炸 —— 老调用点一行没改', () => {
+    expect(selectAgent({ CC2WECHAT_BACKEND: 'codex' } as NodeJS.ProcessEnv).name).toBe('codex');
   });
 });

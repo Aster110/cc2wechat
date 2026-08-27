@@ -138,7 +138,7 @@ Claude Code daemons):
 
 | Variable | Effect |
 |----------|--------|
-| `CC2WECHAT_BACKEND` | `claude-code` (default), `codex` (persistent app-server), or `codex-exec` (one-shot spawn escape hatch) |
+| `CC2WECHAT_BACKEND` | `claude-code` (default), `codex` (persistent app-server), `codex-exec` (one-shot spawn escape hatch), or `claude-app` (drive Claude desktop app sessions — see [docs/claude-app/](docs/claude-app/GATEWAY.md)) |
 | `CC2WECHAT_DELIVERY` | Same values as `delivery` below |
 | `CC2WECHAT_ENGINE` | `v5` / `v6` — force an engine; the ultimate rollback switch |
 | `CC2WECHAT_CODEX_EFFORT` | Overrides codex `model_reasoning_effort` for this channel only |
@@ -213,6 +213,22 @@ Message handling is non-blocking: each conversation gets a serial queue, but the
 never waits on the agent. This matters for slow backends — blocking the poll loop makes the
 platform consider the bot offline. See [docs/codex-backend.md](docs/codex-backend.md) for the
 failure modes this cost us to learn.
+
+### `claude-app` backend (V1, experimental)
+
+`CC2WECHAT_BACKEND=claude-app` routes WeChat messages into **Claude desktop app sessions** instead
+of spawning a CLI: a single *gateway* session in the app holds an SSE connection to the daemon and
+does nothing but `send_message` into per-contact *inbox* sessions; replies are read back by the
+daemon straight from the transcript jsonl (zero extra tokens). Inbox sessions are seeded by hand
+once — the app has no zero-confirmation "create session" path — and are woken automatically after
+that.
+
+- Gateway contract, on-call/re-attach script, failure table: [docs/claude-app/GATEWAY.md](docs/claude-app/GATEWAY.md)
+- Seeding an inbox: [docs/claude-app/SEEDING.md](docs/claude-app/SEEDING.md)
+- CLI: `cc2wechat claude-app seed --name X`, `cc2wechat claude-app status`
+
+Channel-level failures (gateway offline, no inbox seeded) degrade to the codex backend so WeChat
+never goes silent; per-turn failures surface as errors instead of silently switching who answers.
 
 ## Web Terminal
 
