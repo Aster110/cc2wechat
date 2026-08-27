@@ -2,7 +2,9 @@ node_modules/
 dist/
 *.tgz
 
-# Tests: 2026-08-27 起随仓开源(aster 拍板)
+# Tests (keep locally, don't open source)
+tests/
+src/__tests__/
 
 # Internal docs
 CODE_REVIEW.md
