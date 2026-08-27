@@ -121,6 +121,10 @@ function printUsage(): void {
   Skill:
     cc2wechat skill install [--force]   Install the /cc2wechat skill to ~/.claude/skills/
 
+  claude-app backend (Claude desktop app 会话):
+    cc2wechat claude-app seed --name X   播种一个收件箱（一次，终身）
+    cc2wechat claude-app status          自检探针 + 收件箱台账 + 网关连接
+
   Examples:
     cc2wechat login --name aster     # First account
     cc2wechat login --name wife      # Second account (auto port 18082)
@@ -532,6 +536,25 @@ switch (command) {
       console.error(`  ${err instanceof Error ? err.message : err}`);
       process.exit(1);
     }
+    break;
+  }
+
+  case 'claude-app': {
+    // cc2wechat claude-app seed --name X / status [--port N]
+    // 实现在 v6/claude-app/cli.ts（这里只分发，那边才测得动）
+    const port = parseInt(process.env.CC2WECHAT_PORT ?? String(BASE_PORT), 10);
+    const account = getActiveAccount(port);
+    import('./v6/claude-app/cli.js')
+      .then(({ runClaudeAppCli }) =>
+        runClaudeAppCli({ argv: args.slice(1), port, accountId: account?.accountId }),
+      )
+      .then((code) => {
+        if (code !== 0) process.exit(code);
+      })
+      .catch((err) => {
+        console.error(String(err));
+        process.exit(1);
+      });
     break;
   }
 

@@ -12,6 +12,7 @@ import { Replier } from '../v5/sender/replier.js';
 import { createWeChatSender } from '../v5/sender/wechat-sender.js';
 
 import { selectAgent } from './agents/select.js';
+import { isHttpAttachable } from './claude-app/gateway-bus.js';
 import { FileSessionStore } from './session-store.js';
 import { InMemoryScheduler } from './scheduler.js';
 import { Orchestrator } from './orchestrator.js';
@@ -79,7 +80,7 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const cwd = config.cwd ?? process.cwd();
 
-  const agent = selectAgent(process.env, config);
+  const agent = selectAgent(process.env, config, { accountId: account.accountId });
   // 会话表按 accountId 命名;legacyPort 只用于把 v5 的 codex-threads-<port>.json 迁过来
   const store = new FileSessionStore({ accountId: account.accountId, legacyPort: String(HEALTH_PORT) });
   const scheduler = new InMemoryScheduler({
@@ -107,6 +108,14 @@ async function main(): Promise<void> {
     startedAt: new Date().toISOString(),
   });
   log(`Health server on 127.0.0.1:${HEALTH_PORT}`);
+
+  // claude-app 后端要在同一个端口上开网关总线(SSE /claude-app/events + 回执端点)。
+  // 鸭子类型判断而不是 instanceof:哪个后端想挂 HTTP 就自己实现 attachHttp,
+  // main 不必认识具体是谁。其余后端这里什么都不发生。
+  if (isHttpAttachable(agent)) {
+    agent.attachHttp(healthServer);
+    log(`claude-app 网关总线已挂上:GET http://127.0.0.1:${HEALTH_PORT}/claude-app/events`);
+  }
 
   // ---- 优雅停机 --------------------------------------------------------
   // 常驻后端(codex app-server / claude SDK 池)是**子进程**。
