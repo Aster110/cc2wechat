@@ -4,14 +4,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
-import { loginWithQR, loginWithQRWeb } from '../auth.js';
-import { getActiveAccount, saveAccount } from '../store.js';
 import { log, logError } from '../utils.js';
 import { loadConfig } from '../v5/core/config.js';
 import { Replier } from '../v5/sender/replier.js';
 import { createWeChatSender } from '../v5/sender/wechat-sender.js';
 
 import { selectAgent } from './agents/select.js';
+import { bootstrapChannelCore, channelCoreEnabled, ensureAccount } from './channels/bootstrap.js';
 import { isHttpAttachable } from './claude-app/gateway-bus.js';
 import { FileSessionStore } from './session-store.js';
 import { InMemoryScheduler } from './scheduler.js';
@@ -48,6 +47,34 @@ function getAccountName(port: number): string | null {
   return null;
 }
 
+/**
+ * adapter 模式的 daemon:壳(N 个)→ Core → Agent。
+ *
+ * 与 legacy 的区别只有"谁在收发消息":Core 不再认识微信,
+ * 通道从 CC2WECHAT_CHANNELS 选(缺省仍只有 wechat)。
+ * 后端选择、会话表、调度器、/health 全部复用同一套东西。
+ */
+async function startChannelCoreDaemon(): Promise<void> {
+  const handle = await bootstrapChannelCore({ port: HEALTH_PORT });
+
+  console.log(`  Health check: http://127.0.0.1:${handle.port}/health`);
+  console.log(`  Channels: ${handle.channels.map((c) => c.name).join(', ') || '(none)'}`);
+  console.log('  Listening...\n');
+
+  // 常驻后端是子进程,SIGTERM 收不住就会留下抓着 thread 写锁的孤儿(见 legacy 分支同款注释)
+  let stopped = false;
+  const gracefulStop = async (sig: string): Promise<void> => {
+    if (stopped) return;
+    stopped = true;
+    log(`收到 ${sig}，优雅停机中…`);
+    await handle.stop();
+    log('停机完成');
+    process.exit(0);
+  };
+  process.on('SIGTERM', () => void gracefulStop('SIGTERM'));
+  process.on('SIGINT', () => void gracefulStop('SIGINT'));
+}
+
 async function main(): Promise<void> {
   console.log(`\n  cc2wechat v6 — Channel → Core → Agent (${packageVersion()})\n`);
 
@@ -59,20 +86,15 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  let account = getActiveAccount(HEALTH_PORT);
-  if (!account) {
-    console.log('  No saved credentials. Starting login...');
-    const isHeadless = !process.env.DISPLAY && !process.env.BROWSER && process.platform !== 'darwin';
-    const result = isHeadless ? await loginWithQR() : await loginWithQRWeb();
-    saveAccount({
-      accountId: result.accountId.replace(/@/g, '-').replace(/\./g, '-'),
-      token: result.token,
-      baseUrl: result.baseUrl,
-      savedAt: new Date().toISOString(),
-      port: HEALTH_PORT,
-    });
-    account = getActiveAccount(HEALTH_PORT)!;
+  // ---- adapter 模式(Channel 轴)-----------------------------------------
+  // 必须在**碰账号之前**分叉:web-only 侧车跑在没有 ~/.cc2wechat 的机器上,
+  // 那里不该冒出扫码登录。缺省不进这个分支,下面的 legacy 路径一字未动。
+  if (channelCoreEnabled(process.env)) {
+    await startChannelCoreDaemon();
+    return;
   }
+
+  const account = await ensureAccount(HEALTH_PORT);
 
   const accountName = getAccountName(HEALTH_PORT);
   console.log(`  Account: ${account.accountId}${accountName ? ` (${accountName})` : ''}`);
