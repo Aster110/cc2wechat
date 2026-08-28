@@ -253,6 +253,75 @@ The daemon automatically starts a ttyd instance for each tmux session. The URL i
   needs nothing extra
 - Falls back to SDK/Pipe delivery if neither iTerm nor tmux available
 
+## Waku DM channel (`waku-dm`)
+
+Besides WeChat, the same Core can serve a **Waku AI-friend persona**: users DM the persona inside the
+Waku app, a local daemon subscribes to the persona's event bus over SSE, hands the text to your local
+Codex, and posts the reply back into the same DM. No inbound ports, no new transport — platform JWT +
+REST + SSE. Media works both ways: inbound images/videos/voice notes are downloaded to disk and handed
+to Codex as local paths, and Codex sends images/videos/voice/playable cards back with `[[send-…]]`
+markers or the `waku-dm-reply` CLI. Full architecture, env table and troubleshooting:
+[docs/waku-dm-channel.md](docs/waku-dm-channel.md).
+
+```bash
+npm run build
+export WAKU_GATEWAY_CHANNEL=waku-dm
+export WAKU_GATEWAY_API_BASE=https://waku-core-api-yyvdcgnhha-uc.a.run.app/api/v1
+export WAKU_GATEWAY_BRIDGE_CREDENTIAL_FILE=$HOME/.waku-gateway-dm/bridge.credential   # 0600, from `waku agent-friend credential issue <bridge_id> --write <path>`
+export WAKU_GATEWAY_OWNER_USER_IDS=usr_8c8b6c0329f140cd8dc78dfcff7ddeec           # who may talk to the agent
+export WAKU_GATEWAY_STATE_DIR=$HOME/.waku-gateway-dm
+export WAKU_GATEWAY_HEALTH_PORT=18092
+export WAKU_GATEWAY_WORKSPACE_DIR=$HOME/my-project
+export WAKU_GATEWAY_AGENT_BACKEND=codex
+export WAKU_GATEWAY_CODEX_HOME=$HOME/.codex
+node dist/gateway/server.js
+```
+
+| Variable | Effect | Default |
+|----------|--------|---------|
+| `WAKU_GATEWAY_CHANNEL` | `waku-dm`; unset keeps the V1 `waku-mailbox` daemon | `waku-mailbox` |
+| `WAKU_GATEWAY_API_BASE` | Waku Core v1 base URL | from auth.json in session mode |
+| `WAKU_GATEWAY_BRIDGE_CREDENTIAL_FILE` | 0600 file holding the `abc_…` bridge credential (recommended) | — |
+| `WAKU_GATEWAY_AUTH_PATH` | Alternative session mode: a logged-in `waku` auth.json (mutually exclusive with the credential file) | — |
+| `WAKU_GATEWAY_OWNER_USER_IDS` | Comma-separated Waku user ids mapped to the `admin-bypass` endpoint | required |
+| `WAKU_GATEWAY_DEFAULT_TIER` | Tier for everyone else: `deny` (silent) or `chat-only`/`sandbox-workspace`/`repo-pr` (needs `WAKU_GATEWAY_GUEST_WORKSPACE_DIR`) | `deny` |
+| `WAKU_GATEWAY_STATE_DIR` / `HEALTH_PORT` | Own SQLite + loopback ops port (can run next to the V1 daemon) | `~/.waku-gateway-dm` / `18092` |
+| `WAKU_GATEWAY_HEARTBEAT_INTERVAL_MS` / `SSE_IDLE_TIMEOUT_MS` / `COLD_START_GRACE_MS` | Heartbeat cadence, SSE dead-connection threshold, how old a cold-start replay may be | `30000` / `30000` / `60000` |
+| `WAKU_DM_ACK_MS` | Slow-turn notice (“收到，正在处理（复杂任务可能要几分钟）…”); `0` disables. Takes precedence over `CC2WECHAT_ACK_MS`, so the DM daemon can be tuned independently of the WeChat one | `60000` |
+| `CC2WECHAT_ACK_MS` | Same knob, shared with the WeChat channel; used only when `WAKU_DM_ACK_MS` is unset | `60000` |
+| `WAKU_GATEWAY_MEDIA_DIR` / `MEDIA_TTL_MS` / `MEDIA_SWEEP_INTERVAL_MS` | Where inbound media lands, how long it lives, how often it is swept | `<state>/media` / `86400000` / `3600000` |
+| `WAKU_GATEWAY_MEDIA_IMAGE_MAX_BYTES` / `MEDIA_MAX_BYTES` / `MEDIA_TIMEOUT_MS` | Inbound size caps (image / video+voice) and per-download timeout | `16MiB` / `100MiB` / `60000` |
+| `WAKU_DM_VIDEO_TRANSCODE` / `WAKU_GATEWAY_MAX_VIDEO_SECONDS` / `WAKU_GATEWAY_MAX_UPLOAD_BYTES` | Transcode outbound video to ≤720p H.264 + AAC + faststart (needs ffmpeg; **on by default**, `0`/`false`/`off`/`no` disables, skipped when the source already conforms); truncation length; outbound per-file cap | **on** / `60` / `200MiB` |
+| `WAKU_GATEWAY_WORKSPACE_DIR` / `AGENT_BACKEND` / `CODEX_HOME` / `CODEX_EFFORT` / `NODE_ID` / `ENDPOINT_ID` / `TRUST_TIER` | Same as the V1 gateway | same |
+
+Commands inside the DM: `/new` (fresh context, same conversation), `/stop`, `/exit`, `/help`.
+
+**Media & attachments.** Inbound: the daemon downloads the file into `<state>/media/<conv>/<msg>-<i>.<ext>`
+(capped, 60s timeout, swept after 24h) and appends `[Image: /path]` / `[Video: /path]` / `[Voice: /path]`
+to the text, so Codex gets real local paths (`localImage` / `localAudio`); a video additionally gets one
+extracted frame next to it as `[VideoFrame: /path.frame.jpg]`, because Codex's turn input has no video
+block — without that frame the model only sees a file path. Shared playables become a text
+`[Card: <title> content_id=… share_url=…]` marker. Outbound: Codex writes `[[send-image: /abs/path]]`,
+`[[send-video: …]]`, `[[send-audio: …]]`, `[[send-file: /abs/report.pdf]]`,
+`[[send-card: cnt_… launch_ctx={"room":"AB"}]]` in its final answer, or calls
+`waku-dm-reply --image /tmp/shot.png` mid-turn (loopback HTTP to the daemon's ops port; without
+`--conversation` it targets the single running turn and refuses to guess when there are zero or several).
+Outbound video is transcoded to a phone-playable mp4 by default (skipped when the source already conforms).
+Waku DMs have no `file` message kind, so `[[send-file:]]` uploads the document and sends a **text message
+with the public link** (`📎 name（size）` + URL) — allowed: pdf / zip / txt / log / md / csv / json;
+anything a browser would execute (html / svg / js) is refused with a human sentence, because HTML artifacts
+belong in `waku ship` → a playable card. Install the Codex-facing skill with `cc2wechat skill install waku-dm`.
+
+Health: `node dist/gateway/cli.js health` (with `WAKU_GATEWAY_CHANNEL=waku-dm`) or `curl 127.0.0.1:18092/health` —
+`channel: {type, state, cursor, lastEventAt, lastHeartbeatAt, reconnects, tokenState, selfUserId}` plus the V1 `core/runner/endpoints/queues/outbox` blocks.
+Read-only transport smoke against the real backend: `node dist/gateway/server.js --sse-smoke 15` (prints event names and seqs only).
+Golden path: `PERSONA_USER_ID=<id> node scripts/golden-e2e-dm.mjs`;
+media golden path (image in → Codex reads the nonce → image out): `PERSONA_USER_ID=<id> node scripts/golden-e2e-dm-media.mjs`;
+video golden path (video in → Codex reads the burned-in nonce off the extracted frame → playable video out with a poster):
+`PERSONA_USER_ID=<id> node scripts/golden-e2e-dm-video.mjs` (needs ffmpeg on this box);
+file golden path (ask it to send a local file → a text message with 📎 and a fetchable URL):
+`PERSONA_USER_ID=<id> node scripts/golden-e2e-dm-file.mjs`.
+
 ## License
 
 MIT

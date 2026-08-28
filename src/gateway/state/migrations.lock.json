@@ -1,0 +1,23 @@
+{
+  "note": "已发布的 migration 不可再改，只能追加新版本。migrate() 只跑 version > PRAGMA user_version，往旧版本里补 DDL 对所有已存在的库都是死代码（PR #5 的 asset_uploads 就是这么把出站附件在老库上打成 100% 失败的）。改动这个文件 = 你正在改一条已经在别人库里跑过的 migration，请先证明它不该是新版本。",
+  "algorithm": "sha256(SQL 去掉 -- 注释、空白归一后)",
+  "guard": "src/__tests__/gateway/sqlite-store.test.ts › migration 不可变性契约",
+  "migrations": [
+    {
+      "version": 1,
+      "sha256": "ea38de1306d605770342762a28dfd8743efbf8a26faa7a42e1cc25d30411d3e7"
+    },
+    {
+      "version": 2,
+      "sha256": "bae0ce32ca7c6cdf7fbed8c36d524a51ef93f9e3dc870c2038b09ba26fde14d7"
+    },
+    {
+      "version": 3,
+      "sha256": "2435f01b5c702cfd21d6f35a4cf664a77f199616785b5b27b8f775ba84be78ee"
+    },
+    {
+      "version": 4,
+      "sha256": "afd1d04c01434b2015b580bfce045d6bc23febdde79e34c3a4f671598692ddce"
+    }
+  ]
+}

@@ -7,7 +7,7 @@ import os from 'node:os';
 import { loginWithQR, loginWithQRWeb } from './auth.js';
 import { saveAccount, getActiveAccount } from './store.js';
 import { sendMessage, uploadAndSendMedia } from './wechat-api.js';
-import { installSkill } from './skill-install.js';
+import { BUNDLED_SKILLS, installSkill } from './skill-install.js';
 import { resolveReplyContext } from './v6/reply-context.js';
 import { endSession } from './v6/end-session.js';
 import { startEngine } from './v6/engine-select.js';
@@ -119,7 +119,8 @@ function printUsage(): void {
     cc2wechat --file /tmp/f.pdf   Send file
 
   Skill:
-    cc2wechat skill install [--force]   Install the /cc2wechat skill to ~/.claude/skills/
+    cc2wechat skill install [name] [--force]   Install bundled skills to ~/.claude/skills/
+                                       (no name = all: ${BUNDLED_SKILLS.join(', ')})
 
   claude-app backend (Claude desktop app 会话):
     cc2wechat claude-app seed --name X   播种一个收件箱（一次，终身）
@@ -521,17 +522,22 @@ switch (command) {
 
   case 'skill': {
     if (targetName !== 'install') {
-      console.log('  Usage: cc2wechat skill install [--force]');
+      console.log(`  Usage: cc2wechat skill install [${BUNDLED_SKILLS.join('|')}] [--force]`);
       break;
     }
     const pkgRoot = path.join(path.dirname(new URL(import.meta.url).pathname), '..');
     const force = args.includes('--force');
+    // 不指定名字 = 把随包分发的 skill 全装上（一条命令把两条通道的用法都给 agent）。
+    const requested = args.slice(2).filter((a) => !a.startsWith('--'));
+    const names = requested.length > 0 ? requested : [...BUNDLED_SKILLS];
     try {
-      const result = installSkill(pkgRoot, os.homedir(), 'cc2wechat', force);
-      if (result.installed) {
-        console.log(`  ✅ skill installed → ${result.dest}`);
-      } else {
-        console.log(`  Already exists: ${result.dest} (use --force to overwrite)`);
+      for (const name of names) {
+        const result = installSkill(pkgRoot, os.homedir(), name, force);
+        if (result.installed) {
+          console.log(`  ✅ skill installed → ${result.dest}`);
+        } else {
+          console.log(`  Already exists: ${result.dest} (use --force to overwrite)`);
+        }
       }
     } catch (err) {
       console.error(`  ${err instanceof Error ? err.message : err}`);
