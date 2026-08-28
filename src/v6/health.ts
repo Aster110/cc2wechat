@@ -10,14 +10,31 @@ import type { TurnRing } from './poller.js';
 /** agent.health() 的超时。/health 是给运维用的,不能因为后端卡住就一起卡住 */
 const AGENT_HEALTH_TIMEOUT_MS = 1_000;
 
+/** adapter 模式下每个通道的自报健康(legacy 路径没有这个概念) */
+export interface ChannelHealthSnapshot {
+  name: string;
+  ok: boolean;
+  detail?: string;
+  lastOkAt?: number;
+}
+
 export interface V6HealthDeps {
-  account: AccountData;
+  /**
+   * 微信账号。**可以没有** —— web-only 形态跑在没有微信账号的机器上,
+   * 这时输出里 account 为 null,而不是让 /health 崩掉。
+   */
+  account?: AccountData | null;
   agent: Pick<AgentAdapter, 'name' | 'persistent'> & Partial<Pick<AgentAdapter, 'health'>>;
   /** InMemoryScheduler 的汇总视图 */
   scheduler: { stats(): { running: number; queued: number } };
   turns: TurnRing;
   cwd: string;
   startedAt: string;
+  /**
+   * adapter 模式:每个通道的健康快照。
+   * legacy 路径不传 → JSON 里根本不会出现 channels 这个键(输出一字不变)。
+   */
+  channels?: () => ChannelHealthSnapshot[];
 }
 
 /**
@@ -83,12 +100,14 @@ export function startV6HealthServer(port: number, deps: V6HealthDeps): http.Serv
             agent: deps.agent.name,
             persistent: deps.agent.persistent,
             agentHealth,
-            account: deps.account.accountId,
+            account: deps.account?.accountId ?? null,
             cwd: deps.cwd,
             startedAt: deps.startedAt,
             uptime: process.uptime(),
             scheduler: deps.scheduler.stats(),
             turns: deps.turns.list(),
+            // 没有 channels provider 时是 undefined,JSON.stringify 直接丢掉这个键
+            channels: deps.channels?.(),
           }),
         );
       })();
