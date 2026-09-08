@@ -56,10 +56,10 @@ const LOST = '__connection_lost__';
 /**
  * 微信是聊天场景,等不起 xhigh 推理档。
  * 与 codex-exec 同口径:设了才注入,不擅自改用户 config.toml 的默认档。
- * app-server 是进程级注入(整个常驻进程一个档),不是每轮参数。
+ * 进程默认档在启动时注入；thread/start 与 thread/resume 也显式覆盖历史线程配置。
  */
 export function effortConfigFlags(env: NodeJS.ProcessEnv): string[] {
-  const effort = env.CC2WECHAT_CODEX_EFFORT;
+  const effort = env.CC2WECHAT_CODEX_EFFORT?.trim();
   return effort ? ['-c', `model_reasoning_effort="${effort}"`] : [];
 }
 
@@ -543,8 +543,14 @@ export class CodexAppServerAgent implements AgentAdapter {
     wanted: string,
     cwd: string,
   ): Promise<{ threadId: string; error?: string }> {
+    const model = this.env.CC2WECHAT_CODEX_MODEL?.trim();
+    const effort = this.env.CC2WECHAT_CODEX_EFFORT?.trim();
+    const config = model || effort ? {
+      ...(model ? { model } : {}),
+      ...(effort ? { model_reasoning_effort: effort } : {}),
+    } : undefined;
     if (wanted) {
-      const r = await conn.request('thread/resume', { threadId: wanted, excludeTurns: true, cwd }, THREAD_OP_TIMEOUT_MS);
+      const r = await conn.request('thread/resume', { threadId: wanted, excludeTurns: true, cwd, config }, THREAD_OP_TIMEOUT_MS);
       if (!r.error) {
         const id = (r.result?.thread?.id as string | undefined) ?? wanted;
         return { threadId: id };
@@ -553,7 +559,7 @@ export class CodexAppServerAgent implements AgentAdapter {
       log(`[codex] thread/resume ${wanted.slice(0, 8)} 失败(${r.error.message}),改开新线程`);
     }
 
-    const started = await conn.request('thread/start', { cwd }, THREAD_OP_TIMEOUT_MS);
+    const started = await conn.request('thread/start', { cwd, config }, THREAD_OP_TIMEOUT_MS);
     if (started.error) return { threadId: '', error: started.error.message };
     const id = started.result?.thread?.id as string | undefined;
     if (!id) return { threadId: '', error: 'thread/start 没有返回 thread.id' };
