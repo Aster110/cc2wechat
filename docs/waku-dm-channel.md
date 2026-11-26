@@ -277,11 +277,6 @@ WAKU_GATEWAY_CHANNEL=waku-dm WAKU_GATEWAY_AUTH_PATH=$HOME/.config/waku/auth.json
 WAKU_GATEWAY_OWNER_USER_IDS=usr_8c8b6c0329f140cd8dc78dfcff7ddeec WAKU_GATEWAY_WORKSPACE_DIR=/tmp \
 node dist/gateway/server.js --sse-smoke 15
 
-# 金线
-PERSONA_USER_ID=<persona_user_id> node scripts/golden-e2e-dm.mjs
-# 媒体金线（图进 → Codex 念出图里的暗号 → 图出）
-PERSONA_USER_ID=<persona_user_id> node scripts/golden-e2e-dm-media.mjs
-
 # 中途发图（daemon 在跑时，任意终端都能打）
 waku-dm-reply --image /tmp/shot.png --text "看这个"     # 或 node dist/gateway/reply-cli.js
 ```

@@ -315,12 +315,7 @@ belong in `waku ship` → a playable card. Install the Codex-facing skill with `
 Health: `node dist/gateway/cli.js health` (with `WAKU_GATEWAY_CHANNEL=waku-dm`) or `curl 127.0.0.1:18092/health` —
 `channel: {type, state, cursor, lastEventAt, lastHeartbeatAt, reconnects, tokenState, selfUserId}` plus the V1 `core/runner/endpoints/queues/outbox` blocks.
 Read-only transport smoke against the real backend: `node dist/gateway/server.js --sse-smoke 15` (prints event names and seqs only).
-Golden path: `PERSONA_USER_ID=<id> node scripts/golden-e2e-dm.mjs`;
-media golden path (image in → Codex reads the nonce → image out): `PERSONA_USER_ID=<id> node scripts/golden-e2e-dm-media.mjs`;
-video golden path (video in → Codex reads the burned-in nonce off the extracted frame → playable video out with a poster):
-`PERSONA_USER_ID=<id> node scripts/golden-e2e-dm-video.mjs` (needs ffmpeg on this box);
-file golden path (ask it to send a local file → a text message with 📎 and a fetchable URL):
-`PERSONA_USER_ID=<id> node scripts/golden-e2e-dm-file.mjs`.
+No test suite: verify a change by reading it back in production (`/health`, a real DM).
 
 ## License
 

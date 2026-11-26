@@ -113,7 +113,7 @@ const fullCmd = `CC2WECHAT_CONTEXT=${ctxPath} claude --dangerously-skip-permissi
 - 227 个测试全绿，给人虚假的安全感
 
 **防御方案**：
-1. 在 CI 里加一步用 `node --input-type=module` 直接跑入口文件做冒烟测试
+1. 不写测试和注释，上线后在生产读回：部署后直接跑真入口、发一条真消息看回复
 2. ESLint 规则禁止 `require()`（`no-restricted-globals` 或 `@typescript-eslint/no-require-imports`）
 3. 代码审查时对 ESM 项目里出现的 `require` 保持警觉
 

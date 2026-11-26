@@ -16,7 +16,7 @@
  * ⚠️ 头号不变量：**已发布的 migration 不可再改，只能追加新版本。**
  *   `migrate()` 只跑 `version > PRAGMA user_version`，往旧版本里补 DDL 对**所有已存在的库**
  *   都是死代码，而全新库（测试库全是）会一次性跑到最新版本、恰好把它带上 ⇒ 测试全绿、线上全炸。
- *   细节与事故见下方 `MIGRATIONS` 的注释；机器守卫见 `migrations.lock.json`。
+ *   细节与事故见下方 `MIGRATIONS` 的注释。
  */
 import fs from 'node:fs';
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
@@ -262,9 +262,6 @@ export interface OpenGatewayStoreOptions {
  * 跑过的 migration 里加 DDL，等于给那些库写了一段永远不会执行的代码——而且**测试发现不了**：
  * 测试库都是新建的，新建库一次性跑到最新版本，恰好把新加的 DDL 也带上了。
  * 真实事故：PR #5 把 `asset_uploads` 加进 v2，所有 v2 老库上的出站附件从此 100% 失败。
- *
- * 这条不变量由 `migrations.lock.json` + `sqlite-store.test.ts` 的 hash 快照机器守着：
- * 改动已发布版本的 SQL 会当场变红；新增版本要显式登记进 lock 才算数。
  */
 export const MIGRATIONS: ReadonlyArray<{ version: number; sql: string }> = [
   {
