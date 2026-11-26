@@ -13,7 +13,5 @@
     "sourceMap": true
   },
   "include": ["src"],
-  // 测试不进 dist：发包时没人需要它们，而且 e2e 那些 fixture 会把包体撑大。
-  // 类型检查由 `npx tsc -p tsconfig.test.json --noEmit` 单独跑。
-  "exclude": ["node_modules", "dist", "src/__tests__", "tests"]
+  "exclude": ["node_modules", "dist"]
 }
